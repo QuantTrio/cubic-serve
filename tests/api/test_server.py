@@ -110,6 +110,7 @@ async def _invoke(
     method: str = "POST",
     content_type: bytes = b"application/json",
     raw_body: bytes | None = None,
+    headers: list[tuple[bytes, bytes]] | None = None,
     on_send: Callable[[dict[str, object], asyncio.Queue[dict[str, object]]], None] | None = None,
 ) -> list[dict[str, object]]:
     body = raw_body if raw_body is not None else json.dumps(payload).encode()
@@ -131,7 +132,7 @@ async def _invoke(
         "type": "http",
         "method": method,
         "path": path,
-        "headers": [(b"content-type", content_type)],
+        "headers": [(b"content-type", content_type), *(headers or [])],
     }
     await asyncio.wait_for(app(scope, receive, send), timeout=2)
     return sent
@@ -168,6 +169,96 @@ def _sse_json(messages: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 class ServerTests(unittest.TestCase):
+    def test_api_key_rejects_invalid_configuration(self) -> None:
+        backend = _Backend(lambda request: _text_events(request, "hello"))
+        for key in ("", "has space", "newline\n", "\x00", "\x7f", "秘密", 123):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                CubicASGIApp(backend, model_id="fixture", api_key=key)
+
+    def test_api_key_rejects_before_body_read_or_backend_admission(self) -> None:
+        key = "test-secret-key"
+        backend = _Backend(lambda request: _text_events(request, "hello"))
+        backend.ready = False
+        app = CubicASGIApp(backend, model_id="fixture", api_key=key)
+        bad_headers = (
+            [],
+            [(b"authorization", b"Bearer wrong")],
+            [(b"authorization", b"Basic test-secret-key")],
+            [(b"authorization", b"test-secret-key")],
+            [(b"authorization", b"Bearer ")],
+            [(b"authorization", b"Bearer  test-secret-key")],
+            [(b"authorization", b"Bearer test-secret-key ")],
+            [(b"authorization", b"Bearer test-secret-key\xff")],
+            [(b"authorization", b"Bearer test-secret-key"),
+             (b"Authorization", b"Bearer wrong")],
+            [(b"authorization", b"Bearer wrong"), (b"x-api-key", key.encode())],
+            [(b"x-api-key", key.encode()), (b"x-api-key", key.encode())],
+        )
+
+        async def no_body_read():
+            self.fail("unauthenticated requests must not read the body")
+
+        for path in ("/v1/models", "/v1/chat/completions", "/v1/messages", "/v1/health"):
+            for headers in bad_headers:
+                with self.subTest(path=path, headers=headers):
+                    sent = []
+
+                    async def send(message, output=sent):
+                        output.append(message)
+
+                    asyncio.run(app({"type": "http", "method": "POST", "path": path,
+                                     "headers": headers}, no_body_read, send))
+                    self.assertEqual(sent[0]["status"], 401)
+                    self.assertIn((b"www-authenticate", b"Bearer"), sent[0]["headers"])
+                    response = _json_response(sent)
+                    self.assertEqual(response["error"]["type"], "authentication_error")
+                    self.assertEqual(response["error"]["message"], "Unauthorized")
+                    self.assertNotIn(key.encode(), _body(sent))
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(backend.cancelled, [])
+
+    def test_api_key_accepts_bearer_for_models_and_both_chat_protocols(self) -> None:
+        headers = [(b"Authorization", b"bEaReR test-secret-key")]
+        for path, payload in (("/v1/chat/completions", _openai_payload),
+                              ("/v1/messages", _anthropic_payload)):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    backend = _Backend(lambda request: _text_events(request, "hello"))
+                    app = CubicASGIApp(backend, model_id="fixture", api_key="test-secret-key")
+                    with patch.object(server.hmac, "compare_digest",
+                                      wraps=server.hmac.compare_digest) as compare:
+                        result = asyncio.run(_invoke(app, path, payload(stream=stream),
+                                                     headers=headers))
+                    self.assertEqual(result[0]["status"], 200)
+                    self.assertIn(b"hello", _body(result))
+                    self.assertEqual(len(backend.requests), 1)
+                    self.assertEqual(compare.call_count, 1)
+        result = asyncio.run(_invoke(app, "/v1/models", {}, method="GET", headers=headers))
+        self.assertEqual(result[0]["status"], 200)
+
+    def test_api_key_supports_anthropic_header_only_for_messages(self) -> None:
+        for stream in (False, True):
+            backend = _Backend(lambda request: _text_events(request, "hello"))
+            app = CubicASGIApp(backend, model_id="fixture", api_key="test-secret-key")
+            headers = [(b"X-Api-Key", b"test-secret-key")]
+            result = asyncio.run(_invoke(app, "/v1/messages", _anthropic_payload(stream=stream),
+                                         headers=headers))
+            self.assertEqual(result[0]["status"], 200)
+            self.assertIn(b"hello", _body(result))
+            result = asyncio.run(_invoke(app, "/v1/models", {}, method="GET", headers=headers))
+            self.assertEqual(result[0]["status"], 401)
+
+    def test_api_key_leaves_root_health_and_options_unauthenticated(self) -> None:
+        backend = _Backend(lambda request: _text_events(request, "hello"))
+        app = CubicASGIApp(backend, model_id="fixture", api_key="test-secret-key")
+        result = asyncio.run(_invoke(app, "/health", {}, method="GET"))
+        self.assertEqual(result[0]["status"], 200)
+        result = asyncio.run(_invoke(app, "/v1/models", {}, method="OPTIONS"))
+        self.assertEqual(result[0]["status"], 405)
+        result = asyncio.run(_invoke(app, "/v1/health", {}, method="GET",
+                                     headers=[(b"authorization", b"Bearer test-secret-key")]))
+        self.assertEqual(result[0]["status"], 200)
+
     def test_default_request_id_is_compact(self) -> None:
         backend = _Backend(lambda request: _text_events(request, "unused"))
         app = CubicASGIApp(backend, model_id="fixture")

@@ -271,6 +271,12 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.exit(2, f"error: {message}\n")
 
 
+def _parse_api_key(value: str) -> str:
+    if not value or any(not 33 <= ord(char) <= 126 for char in value):
+        raise argparse.ArgumentTypeError("expected a non-empty printable ASCII key without spaces")
+    return value
+
+
 def _parse_served_model_name(value: str) -> str:
     if not value or value.strip() != value:
         raise argparse.ArgumentTypeError("served model names must be non-empty without surrounding whitespace")
@@ -315,6 +321,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     server_options.add_argument("--host", default="127.0.0.1")
     server_options.add_argument("--port", type=int, default=8000)
+    server_options.add_argument(
+        "--api-key", type=_parse_api_key,
+        help="Require this API key for /v1 requests; disabled when omitted",
+    )
     server_options.add_argument(
         "--http-keep-alive-seconds",
         type=int,
@@ -1067,7 +1077,10 @@ def _serve_model(args: argparse.Namespace, *, model_definition_source=None) -> N
     if args.device is None:
         args.device = f"cuda:{_parse_devices(args.devices, args.tp_size * args.pp_size)[0]}"
 
-    _LOGGER.info("startup args=%s", _canonical_json(vars(args)))
+    startup_args = vars(args).copy()
+    if startup_args.get("api_key") is not None:
+        startup_args["api_key"] = "<redacted>"
+    _LOGGER.info("startup args=%s", _canonical_json(startup_args))
     _LOGGER.info("repository version=%s", _repository_version())
 
     operator_config_path = getattr(args, "operator_config", None)
@@ -1345,7 +1358,10 @@ def _serve_model(args: argparse.Namespace, *, model_definition_source=None) -> N
                     **_structured_outputs_kwargs(args),
                 )
         served_model_names = getattr(args, "served_model_name", None)
-        app = CubicASGIApp(backend, model_id=model_id, served_model_name=served_model_names)
+        app = CubicASGIApp(
+            backend, model_id=model_id, served_model_name=served_model_names,
+            api_key=getattr(args, "api_key", None),
+        )
         public_model_id = served_model_names[0] if served_model_names else model_id
         config = uvicorn.Config(
             app,

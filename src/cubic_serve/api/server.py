@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing_extensions import Never, TypeVar
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import time
@@ -166,7 +168,9 @@ def _error(
 ) -> WireObject:
     if status >= 500:
         message = "service temporarily unavailable" if status == 503 else "internal server error"
-    if kind is BackendErrorKind.MODEL_NOT_FOUND or status == 404:
+    if status == 401:
+        openai_type = anthropic_type = "authentication_error"
+    elif kind is BackendErrorKind.MODEL_NOT_FOUND or status == 404:
         openai_type = anthropic_type = "not_found_error"
     elif kind is BackendErrorKind.OVERLOADED or status == 429:
         openai_type, anthropic_type = "rate_limit_error", "overloaded_error"
@@ -188,14 +192,17 @@ def _error(
 
 async def _send_json(send: ASGISend, status: int, payload: WireObject) -> None:
     body = _json_bytes(payload)
+    headers = [
+        (b"content-type", b"application/json; charset=utf-8"),
+        (b"content-length", str(len(body)).encode()),
+    ]
+    if status == 401:
+        headers.append((b"www-authenticate", b"Bearer"))
     await send(
         {
             "type": "http.response.start",
             "status": status,
-            "headers": [
-                (b"content-type", b"application/json; charset=utf-8"),
-                (b"content-length", str(len(body)).encode()),
-            ],
+            "headers": headers,
         }
     )
     await send({"type": "http.response.body", "body": body, "more_body": False})
@@ -683,11 +690,20 @@ class CubicASGIApp:
         *,
         model_id: str,
         served_model_name: str | Sequence[str] | None = None,
+        api_key: str | None = None,
         request_id_factory: Callable[[], str] | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         if type(model_id) is not str or not model_id or model_id.strip() != model_id:
             raise ValueError("ASGI model_id must be canonical and non-empty")
+        if api_key is not None and (
+            type(api_key) is not str or not api_key
+            or any(not 33 <= ord(char) <= 126 for char in api_key)
+        ):
+            raise ValueError("api_key must be non-empty printable ASCII without spaces")
+        self._api_key_digest = (
+            None if api_key is None else hashlib.sha256(api_key.encode("ascii")).digest()
+        )
         names = ((model_id,) if served_model_name is None else
                  (served_model_name,) if isinstance(served_model_name, str) else
                  tuple(served_model_name))
@@ -705,6 +721,36 @@ class CubicASGIApp:
         value = getattr(self.backend, "ready", True)
         return type(value) is bool and value
 
+    def _authorized(self, scope: ASGIScope, path: str) -> bool:
+        expected = self._api_key_digest
+        if expected is None:
+            return True
+        headers = scope.get("headers", [])
+        if type(headers) is not list:
+            return False
+        authorization: list[bytes] = []
+        anthropic_keys: list[bytes] = []
+        for item in headers:
+            if (type(item) is not tuple or len(item) != 2
+                    or any(type(part) is not bytes for part in item)):
+                return False
+            name, value = item
+            if name.lower() == b"authorization":
+                authorization.append(value)
+            elif name.lower() == b"x-api-key":
+                anthropic_keys.append(value)
+        if len(authorization) > 1 or len(anthropic_keys) > 1:
+            return False
+        if authorization:
+            scheme, _, credential = authorization[0].partition(b" ")
+            if scheme.lower() != b"bearer":
+                return False
+        elif path == "/v1/messages" and anthropic_keys:
+            credential = anthropic_keys[0]
+        else:
+            return False
+        return hmac.compare_digest(hashlib.sha256(credential).digest(), expected)
+
     async def __call__(self, scope: ASGIScope, receive: ASGIReceive, send: ASGISend) -> None:
         if scope.get("type") != "http":
             raise RuntimeError("CubicASGIApp supports only ASGI HTTP scopes")
@@ -712,6 +758,13 @@ class CubicASGIApp:
         path = scope.get("path")
         if type(path) is not str:
             path = ""
+        if (self._api_key_digest is not None
+                and (path == "/v1" or path.startswith("/v1/"))
+                and scope.get("method") != "OPTIONS"
+                and not self._authorized(scope, path)):
+            protocol = _Protocol.ANTHROPIC if path == "/v1/messages" else _Protocol.OPENAI
+            await _send_json(response, 401, _error(protocol, 401, "Unauthorized"))
+            return
         if path in ("/health", "/v1/health"):
             if scope.get("method") != "GET":
                 await _send_json(

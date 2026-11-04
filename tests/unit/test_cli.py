@@ -32,12 +32,26 @@ class CLITests(unittest.TestCase):
             self.assertIn("--port", server)
             self.assertIn("--served-model-name", server)
             self.assertIn("--log-config", server)
+            self.assertIn("--api-key", server)
             debug = text.split("\nAdvanced, audit and debug:\n")[1]
             for flag in ("--startup-numerical-audit", "--execution-mode", "--operator-config"):
                 self.assertIn(flag, debug)
                 self.assertNotIn(flag, server)
             for title in ("Devices and parallelism", "Memory and cache", "Scheduling", "Multimodal input"):
                 self.assertIn(f"\n{title}:\n", text)
+
+    def test_api_key_is_optional_explicit_and_rejects_invalid_values_without_echo(self):
+        with patch.dict("os.environ", {"CUBIC_SERVE_API_KEY": "unused", "VLLM_API_KEY": "unused"}):
+            self.assertIsNone(build_parser().parse_args(["serve", "/checkpoint"]).api_key)
+        args = build_parser().parse_args(["serve", "/checkpoint", "--api-key", "sk-test-secret"])
+        self.assertEqual(args.api_key, "sk-test-secret")
+        for key in ("", "secret with spaces", "secret\nkey", "秘密", "secret\x00key"):
+            output = io.StringIO()
+            with redirect_stderr(output), self.assertRaises(SystemExit) as result:
+                build_parser().parse_args(["serve", "/checkpoint", "--api-key", key])
+            self.assertEqual(result.exception.code, 2)
+            if key:
+                self.assertNotIn(key, output.getvalue())
 
     def test_served_model_name_accepts_aliases_and_rejects_empty_names(self):
         args = build_parser().parse_args([
@@ -376,7 +390,9 @@ print(json.dumps({
             (Path(directory) / "config.json").write_text(json.dumps({
                 "model_type": "qwen4_exp", "text_config": {"dtype": "bfloat16"},
             }))
-            args = build_parser().parse_args(["serve", directory, "--tp-size", "4"])
+            args = build_parser().parse_args([
+                "serve", directory, "--tp-size", "4", "--api-key", "local-test-secret",
+            ])
             backend, executor = MagicMock(), MagicMock()
             executor.max_sequence_tokens = 262144
             with (
@@ -387,10 +403,15 @@ print(json.dumps({
                 patch("cubic_serve.api.CubicASGIApp") as app,
                 patch("uvicorn.Config"),
                 patch("cubic_serve.cli._run_http_server"),
+                patch("cubic_serve.cli._LOGGER.info") as info,
             ):
                 _serve_qwen3_5(args)
             factory.assert_called_once_with(args, None)
-            app.assert_called_once_with(backend, model_id="flash", served_model_name=None)
+            app.assert_called_once_with(backend, model_id="flash", served_model_name=None,
+                                        api_key="local-test-secret")
+            self.assertEqual(args.api_key, "local-test-secret")
+            self.assertEqual(json.loads(info.call_args_list[0].args[1])["api_key"], "<redacted>")
+            self.assertNotIn("local-test-secret", str(info.call_args_list))
             legacy.assert_not_called()
             executor.close.assert_called_once()
 

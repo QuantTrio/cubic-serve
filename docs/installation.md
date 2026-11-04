@@ -121,6 +121,13 @@ keep their original values. Without the option, the checkpoint model ID is used.
 parallelism, Memory and cache, Scheduling, Multimodal input, and Advanced, audit
 and debug. `cubic qualify --help` uses the same groups.
 
+To require an API key, add `--api-key YOUR_KEY`. Clients send
+`Authorization: Bearer YOUR_KEY`; Anthropic `/v1/messages` clients may instead
+send `x-api-key: YOUR_KEY`. Missing or invalid credentials return HTTP 401 before
+request admission. `/health` remains public; `/v1/health` requires the key.
+Authentication is disabled when `--api-key` is omitted. The key is redacted from
+startup logs. No API-key environment variable is used.
+
 All writable caches use `CUBIC_SERVE_CACHE_DIR`, defaulting to
 `${XDG_CACHE_HOME:-~/.cache}/cubic-serve`. Checkpoint metadata and operator plans
 live directly under this root; native, Triton, CUDA-driver and Torch compiler
