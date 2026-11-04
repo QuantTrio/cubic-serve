@@ -52,7 +52,7 @@ unnecessary after installation.
 ## Install a wheel
 
 ```bash
-python -m pip install /path/to/cubic_serve-0.0.0+cu130-py3-none-linux_x86_64.whl
+python -m pip install /path/to/cubic_serve-0.1.0+cu130-py3-none-linux_x86_64.whl
 ```
 
 The **same Cubic wheel** is used on Python 3.10, 3.11, 3.12, 3.13 and 3.14.
@@ -121,6 +121,14 @@ keep their original values. Without the option, the checkpoint model ID is used.
 parallelism, Memory and cache, Scheduling, Multimodal input, and Advanced, audit
 and debug. `cubic qualify --help` uses the same groups.
 
+`--cuda-graph-max-tokens` is optional and defaults to `auto`. Startup selects a
+common graph limit from each rank's available memory after weights and runtime
+reserves, accounting for model dimensions, precision and MTP. Request count and
+context limits do not determine this graph budget. Advanced users can specify a
+fixed limit, for example `--cuda-graph-max-tokens 256`. Smaller limits can reduce
+prefill batching and the number of requests reviewed together; context capacity
+remains governed by the shared cache pool.
+
 To require an API key, add `--api-key YOUR_KEY`. Clients send
 `Authorization: Bearer YOUR_KEY`; Anthropic `/v1/messages` clients may instead
 send `x-api-key: YOUR_KEY`. Missing or invalid credentials return HTTP 401 before
@@ -181,7 +189,7 @@ toolkit at build time. They include kernel sources for startup compilation.
 ```bash
 python -m pip install build
 python -m build
-python tools/check_install.py --wheel dist/cubic_serve-0.0.0-py3-none-any.whl
+python tools/check_install.py --wheel dist/cubic_serve-0.1.0-py3-none-any.whl
 ```
 
 For the CUDA release, use the checked publisher pipeline from a clone. Prepare

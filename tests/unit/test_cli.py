@@ -20,6 +20,20 @@ TOY_ADAPTER = REPOSITORY / "examples" / "toy_adapter.py"
 
 
 class CLITests(unittest.TestCase):
+    def test_graph_limit_defaults_to_auto_with_explicit_advanced_override(self):
+        parser = build_parser()
+        for command in ("serve", "qualify"):
+            self.assertEqual(parser.parse_args([command, "/model"]).cuda_graph_max_tokens, "auto")
+            self.assertEqual(parser.parse_args([
+                command, "/model", "--cuda-graph-max-tokens", "auto",
+            ]).cuda_graph_max_tokens, "auto")
+            self.assertEqual(parser.parse_args([
+                command, "/model", "--cuda-graph-max-tokens", "256",
+            ]).cuda_graph_max_tokens, 256)
+            for value in ("0", "-1", "invalid"):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    parser.parse_args([command, "/model", "--cuda-graph-max-tokens", value])
+
     def test_startup_version_does_not_require_git(self):
         from cubic_serve import __version__
         from cubic_serve.cli import _serve_model

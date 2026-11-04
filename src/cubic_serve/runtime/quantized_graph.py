@@ -167,6 +167,32 @@ def _text_graph_owner_capacity(capacities: tuple[int, ...], max_speculative_toke
     return 1 << (roots.bit_length() - 1)
 
 
+def _auto_text_graph_capacities(
+    available_bytes: int, *, vocabulary_size: int, hidden_size: int,
+    element_bytes: int, tp_size: int, bodies: int, max_speculative_tokens: int,
+) -> tuple[int, ...]:
+    """Bound startup graph rows from live headroom and tensor geometry.
+
+    Allow a quarter of post-weight, post-reserve headroom for graphs. Per body,
+    price four compute-type and two FP32 vocabulary planes, plus 32 compute-type
+    hidden planes. This conservative sizing prior is not a resource receipt:
+    complete portfolio calibration and live cache admission remain mandatory.
+    The established 1024-row ceiling and permanent M1 anchor remain unchanged.
+    """
+    if type(available_bytes) is not int or available_bytes < 0 or any(
+        type(n) is not int or n <= 0
+        for n in (vocabulary_size, hidden_size, element_bytes, tp_size, bodies)
+    ):
+        raise ValueError("automatic CUDA graph sizing requires valid byte and tensor geometry")
+    local_vocabulary = (vocabulary_size + tp_size - 1) // tp_size
+    row_bytes = bodies * (
+        local_vocabulary * (4 * element_bytes + 2 * 4) + hidden_size * 32 * element_bytes
+    )
+    minimum = 1 << max_speculative_tokens.bit_length()
+    rows = max(minimum, min(1024, available_bytes // (4 * row_bytes)))
+    return _text_graph_capacities(rows, max_speculative_tokens)
+
+
 def _prepare_capture_inputs(stage, capacities, qualification):
     """One target/provider boundary between live binding and offline corpora."""
     if qualification is None or qualification.recording:
@@ -335,8 +361,7 @@ def _worker(
         from cubic_serve.ops.cuda.startup import startup_weight_identity
         identity = execution_identity(admission)
         engineering = getattr(admission, "startup_qualification", False) or admission.startup_numerical_audit
-        qualification = ((StartupQualification.for_admission(admission, rank, device)
-                          if engineering else StartupPreparation(rank, device,
+        qualification = ((None if engineering else StartupPreparation(rank, device,
                               topology=(topology.tp_size, topology.pp_size, topology.ep_size)))
                          if admission.execution_mode == "cuda" else None)
         # A first bucket may load a cost model later reused without file reads.
@@ -352,7 +377,7 @@ def _worker(
             identity.sealed.topology_digest, identity.sealed.partition_digest, rank,
             admission.operator_config.digest, str(admission.mamba_ssm_cache_dtype),
         ), allow_calibration=(not admission.startup_numerical_audit and (
-            qualification is None or qualification.engineering and qualification.recording))))
+            admission.execution_mode != "cuda" or engineering))))
         phase_started = time.perf_counter()
         weight_loading_started = phase_started
         memory_budget.apply_allocator_limit()
@@ -421,6 +446,28 @@ def _worker(
             weights_loaded_at - weight_loading_started,
             weights.loading_wait_seconds,
         )
+        if getattr(admission, "auto_graph_max_tokens", False):
+            torch.cuda.empty_cache()
+            free, _ = torch.cuda.mem_get_info(device)
+            available = max(0, memory_budget.remaining_bytes(free)
+                            - admission.input_encoder_reserves.get(placement.device_index, 0))
+            text = builtin_text_config(admission.config)
+            capacities = _auto_text_graph_capacities(
+                available, vocabulary_size=text.vocabulary_size, hidden_size=text.hidden_size,
+                element_bytes=probe.hidden.element_size(), tp_size=topology.tp_size,
+                bodies=1 + int(draft_provider is not None),
+                max_speculative_tokens=admission.max_speculative_tokens,
+            )
+            common_limit = torch.tensor([capacities[-1]], dtype=torch.int64, device=device)
+            all_reduce(common_limit, op=dist.ReduceOp.MIN)
+            admission.graph_capacities = _text_graph_capacities(
+                int(common_limit.item()), admission.max_speculative_tokens)
+            admission.graph_request_capacity = _text_graph_owner_capacity(
+                admission.graph_capacities, admission.max_speculative_tokens)
+            if rank == 0:
+                _LOGGER.info("CUDA graph token limit: %d (auto)", admission.graph_capacities[-1])
+        if engineering and admission.execution_mode == "cuda":
+            qualification = StartupQualification.for_admission(admission, rank, device)
         numerical_witnesses: dict[str, Any] = {}
         reference_math_memo = None
         if admission.startup_numerical_audit:
@@ -1615,7 +1662,7 @@ class TextGraphExecutor:
         max_requests: int,
         max_context: int | None,
         prefill_chunk: int | None,
-        cuda_graph_max_tokens: int = 1024,
+        cuda_graph_max_tokens: int | str = "auto",
         operator_config: OperatorConfig | None,
         eos_token_ids: tuple[int, ...],
         use_prefix_cache: bool = True,
@@ -1661,7 +1708,9 @@ class TextGraphExecutor:
         # Validate even before model/checkpoint I/O. This budget bounds physical
         # rows, including padding, rather than rounding above an administrator's
         # limit to accommodate a particular request count.
-        _text_graph_capacities(cuda_graph_max_tokens, max_speculative_tokens)
+        auto_graph_max_tokens = cuda_graph_max_tokens == "auto"
+        graph_token_limit = 1024 if auto_graph_max_tokens else cuda_graph_max_tokens
+        _text_graph_capacities(graph_token_limit, max_speculative_tokens)
         root = Path(model_root)
         if model_definition_source is not None:
             model_definition_source.verify_source()
@@ -1783,7 +1832,7 @@ class TextGraphExecutor:
         # The existing fair scheduler drains larger client populations through
         # complete transactions in these sealed buckets; it never captures a
         # graph at runtime or falls back to eager execution.
-        capacities = _text_graph_capacities(cuda_graph_max_tokens, max_speculative_tokens)
+        capacities = _text_graph_capacities(graph_token_limit, max_speculative_tokens)
         graph_request_capacity = _text_graph_owner_capacity(capacities, max_speculative_tokens)
         from cubic_serve.runtime.speculative import DraftPolicyConfig
         block_size = graph_definition.block_size_tokens
@@ -1809,6 +1858,7 @@ class TextGraphExecutor:
             ),
             auto_max_sequence_tokens=max_context is None,
             graph_capacities=capacities,
+            auto_graph_max_tokens=auto_graph_max_tokens,
             graph_request_capacity=graph_request_capacity,
             draft_provider=draft_provider,
             num_speculative_tokens=num_speculative_tokens,

@@ -44,7 +44,7 @@ compatibility limits, and the reproducible wheel build process.
 Install a CUDA wheel:
 
 ```bash
-python -m pip install ./cubic_serve-0.0.0+cu130-py3-none-linux_x86_64.whl
+python -m pip install ./cubic_serve-0.1.0+cu130-py3-none-linux_x86_64.whl
 ```
 
 Or install from a clone:

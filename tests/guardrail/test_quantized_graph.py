@@ -1133,6 +1133,41 @@ def test_text_graph_budget_keeps_all_anchors_without_exceeding_admin_limit(budge
     assert all(b == 2 * a for a, b in zip(capacities, capacities[1:]))
 
 
+def test_automatic_graph_rows_follow_headroom_and_tensor_geometry():
+    from cubic_serve.runtime.quantized_graph import _auto_text_graph_capacities
+
+    geometry = dict(vocabulary_size=248320, hidden_size=5120,
+                    element_bytes=2, tp_size=2, bodies=2, max_speculative_tokens=3)
+
+    def choose(available, **changes):
+        return _auto_text_graph_capacities(available, **(geometry | changes))
+
+    assert choose(6 << 30)[-1] == 256
+    assert choose(60 << 30)[-1] == 1024
+    assert choose(6 << 30, vocabulary_size=2 * geometry['vocabulary_size'])[-1] < 256
+    assert choose(6 << 30, bodies=1)[-1] > 256
+    assert choose(6 << 30, tp_size=4)[-1] > 256
+    assert choose(6 << 30, element_bytes=4)[-1] < 256
+    limits = [choose(n << 28)[-1] for n in range(100)]
+    assert limits == sorted(limits)
+    assert limits[0] == 4
+    assert all(m & (m - 1) == 0 for m in limits)
+    # Neither the client ceiling nor context length is an input to this policy.
+    assert choose(6 << 30) == tuple(1 << i for i in range(9))
+
+
+@pytest.mark.parametrize("change", [dict(available_bytes=-1), dict(vocabulary_size=0),
+                                  dict(hidden_size=0), dict(element_bytes=0),
+                                  dict(tp_size=0), dict(bodies=0)])
+def test_automatic_graph_rows_reject_invalid_resources(change):
+    from cubic_serve.runtime.quantized_graph import _auto_text_graph_capacities
+
+    inputs = dict(available_bytes=6 << 30, vocabulary_size=248320, hidden_size=5120,
+                  element_bytes=2, tp_size=2, bodies=2, max_speculative_tokens=3)
+    with pytest.raises(ValueError, match="geometry"):
+        _auto_text_graph_capacities(**(inputs | change))
+
+
 @pytest.mark.parametrize("budget,depth", [(1, 1), (3, 2), (8, 8)])
 def test_text_graph_budget_rejects_incomplete_speculative_transaction(budget, depth):
     from cubic_serve.runtime.quantized_graph import _text_graph_capacities

@@ -202,6 +202,15 @@ def _parse_max_model_len(value: str) -> int | None:
         raise argparse.ArgumentTypeError("expected an integer or 'auto'") from error
 
 
+def _parse_graph_max_tokens(value: str) -> int | str:
+    parsed = _parse_max_model_len(value)
+    if parsed is None:
+        return "auto"
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer or 'auto'")
+    return parsed
+
+
 def _parse_gib(value: str) -> int | None:
     if value.strip().lower() == "auto":
         return None
@@ -419,8 +428,9 @@ def build_parser() -> argparse.ArgumentParser:
     scheduling_options.add_argument("--max-running-requests", type=int, default=256)
     scheduling_options.add_argument("--token-budget", type=int, default=16)
     scheduling_options.add_argument(
-        "--cuda-graph-max-tokens", type=int, default=1024,
-        help="Physical token-row budget for startup text CUDA graphs (default: 1024); "
+        "--cuda-graph-max-tokens", type=_parse_graph_max_tokens, default="auto",
+        metavar="TOKENS|auto",
+        help="Physical token-row budget for startup text CUDA graphs (default: auto); "
              "independent of max-running-requests. Includes speculative review and padding; "
              "uses power-of-two anchors at or below the budget.",
     )
@@ -1089,7 +1099,9 @@ def _serve_model(args: argparse.Namespace, *, model_definition_source=None) -> N
         raise ValueError("--port must be between 0 and 65535")
     if args.http_keep_alive_seconds <= 0:
         raise ValueError("--http-keep-alive-seconds must be positive")
-    if args.token_budget <= 0 or args.cuda_graph_max_tokens <= 0 or (
+    if args.token_budget <= 0 or (
+        args.cuda_graph_max_tokens != "auto" and args.cuda_graph_max_tokens <= 0
+    ) or (
         args.prefill_chunk_tokens is not None and args.prefill_chunk_tokens <= 0
     ):
         raise ValueError("scheduler token budgets must be positive")
