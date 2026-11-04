@@ -1,0 +1,34 @@
+Cubic Serve
+Copyright 2026 Cubic Serve contributors
+
+Cubic Serve's original code is licensed under the Apache License, Version 2.0.
+Third-party code retains its original license and attribution notices. The
+project license does not replace the licenses of the components listed below.
+
+Marlin / vLLM
+------------
+The native Marlin sources include work by Elias Frantar (Marlin), Neural Magic,
+and vLLM contributors, distributed under Apache-2.0. Original notices remain in
+the source files. Cubic Serve modifications and pinned source provenance are
+documented in:
+  src/cubic_serve/quantization/common/marlin/native/NOTICE.md
+The accompanying license is:
+  src/cubic_serve/quantization/common/marlin/native/LICENSE
+
+NInfer-derived packed row kernels
+--------------------------------
+The packed small-row kernel's pipeline structure derives from
+T-Crypt/ninfer-4090 under Apache-2.0. Its source identifies this provenance:
+  src/cubic_serve/quantization/common/small_rows.cu
+Its accompanying license is:
+  src/cubic_serve/quantization/common/small_rows.LICENSE
+
+llama.cpp / ggml
+---------------
+Bundled ggml sources are distributed under the MIT License.
+Copyright (c) 2023-2026 The ggml authors.
+Original source notices and the complete MIT permission notice are retained in:
+  src/cubic_serve/quantization/extensions/ggml/upstream/LICENSE
+
+Model weights and separately downloaded assets are not covered by this project
+license. Their respective publishers' licenses apply.

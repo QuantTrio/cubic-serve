@@ -112,3 +112,11 @@ inference engineering ideas this project learns from:
 - [NInfer](https://github.com/Neroued/ninfer)
 
 Included third-party components retain their upstream license notices.
+
+## License
+
+Cubic Serve's original code is licensed under [Apache-2.0](LICENSE).
+Bundled third-party components retain their own Apache-2.0 or MIT licenses;
+see [NOTICE](NOTICE) and the accompanying component notices. The package's
+`Apache-2.0 AND MIT` expression records both sets of distribution obligations.
+Model weights and other separately downloaded assets retain their own licenses.

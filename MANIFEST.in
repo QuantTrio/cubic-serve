@@ -1,5 +1,5 @@
 global-exclude *
-include README.md pyproject.toml MANIFEST.in
+include README.md LICENSE NOTICE pyproject.toml MANIFEST.in
 include docs/installation.md
 include docs/assets/cubicquant.gif
 include tools/check_install.py
