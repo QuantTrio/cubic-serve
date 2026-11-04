@@ -10,7 +10,7 @@ complete professional serving stack.
 
 ## Features
 
-- Cubic quantization and GGUF formats, with partial support depending on the checkpoint and encoding.
+- Support for INT, CubicQuant, GGUF, FP8, NVFP4, and other model and quantization formats.
 - Single- and multi-GPU serving with CUDA Graphs, shared KV/state memory, and prefix caching.
 - INT4/INT6/INT8 K and V caches, with independent dtype selection.
 - Dynamic MTP for supported checkpoints.
