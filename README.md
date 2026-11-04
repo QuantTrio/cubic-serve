@@ -6,6 +6,8 @@ Cubic Serve focuses on **Cubic, GGUF, and custom quantization formats** for
 **high concurrency on a single node**. It is an experimental engine, not a
 complete professional serving stack.
 
+![CubicQuant: The Curve Behind the Bits](docs/assets/cubicquant.gif)
+
 ## Features
 
 - Cubic quantization and GGUF formats, with partial support depending on the checkpoint and encoding.

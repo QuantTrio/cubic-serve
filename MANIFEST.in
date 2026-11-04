@@ -1,6 +1,7 @@
 global-exclude *
 include README.md pyproject.toml MANIFEST.in
 include docs/installation.md
+include docs/assets/cubicquant.gif
 include tools/check_install.py
 include tools/build_cuda.py tools/cubic_build_backend.py setup.py
 include tools/build_release.py
