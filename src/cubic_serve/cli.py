@@ -8,7 +8,6 @@ import logging
 import os
 import signal
 import socket
-import subprocess
 import sys
 import time
 from collections.abc import Iterator, Sequence
@@ -121,19 +120,6 @@ def _run_http_server(
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _repository_version() -> str:
-    source_root = Path(__file__).resolve().parents[2]
-    completed = subprocess.run(
-        ("git", "rev-parse", "--short=12", "HEAD"),
-        cwd=source_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    revision = completed.stdout.strip()
-    return revision if completed.returncode == 0 and revision else "unknown"
 
 
 def _model_payload(model_code: str) -> dict[str, Any]:
@@ -1081,7 +1067,7 @@ def _serve_model(args: argparse.Namespace, *, model_definition_source=None) -> N
     if startup_args.get("api_key") is not None:
         startup_args["api_key"] = "<redacted>"
     _LOGGER.info("startup args=%s", _canonical_json(startup_args))
-    _LOGGER.info("repository version=%s", _repository_version())
+    _LOGGER.info("cubic-serve version=%s", __version__)
 
     operator_config_path = getattr(args, "operator_config", None)
     operator_config = _serve_operator_config(args)

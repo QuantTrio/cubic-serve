@@ -15,6 +15,7 @@ import pkgutil
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 
@@ -158,6 +159,25 @@ def check_wheel(path: Path, source_root: Path | None) -> dict:
                 'aot_recipes': units, 'cubin_images': images}
 
 
+def check_git_free_startup() -> dict:
+    """Reach normal startup/version logging without Git or loading model weights."""
+    import cubic_serve
+
+    with tempfile.TemporaryDirectory(prefix='cubic-git-free-') as empty:
+        result = subprocess.run(
+            [sys.executable, '-m', 'cubic_serve.cli', 'serve', 'installation-check',
+             '--execution-mode', 'eager', '--port', '65536'],
+            cwd=empty, env={**os.environ, 'PATH': empty, 'CUDA_VISIBLE_DEVICES': ''},
+            capture_output=True, text=True,
+        )
+    output = result.stdout + result.stderr
+    if (result.returncode != 2
+            or f'cubic-serve version={cubic_serve.__version__}' not in output
+            or 'error: --port must be between 0 and 65535' not in output):
+        raise RuntimeError(f'Installed startup without Git failed:\n{output}')
+    return {'git_free_startup': 'passed'}
+
+
 def check_installed() -> dict:
     # Keep this set before importing any runtime dependency or walking packages.
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
@@ -174,11 +194,12 @@ def check_installed() -> dict:
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if importlib.metadata.version('cubic-serve') != cubic_serve.__version__:
         raise RuntimeError('Installed metadata and package version differ')
+    startup = check_git_free_startup()
     files = [p for p in root.rglob('*') if p.is_file() and native_file(p)]
     return {'python': sys.version.split()[0], 'package': str(root),
             'modules_imported': len(imported), 'native_files': len(files),
             'torch': importlib.metadata.version('torch'),
-            'triton': importlib.metadata.version('triton'), **host}
+            'triton': importlib.metadata.version('triton'), **host, **startup}
 
 
 def main() -> None:

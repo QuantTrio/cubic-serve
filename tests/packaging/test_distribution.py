@@ -43,3 +43,11 @@ def test_cli_version(capsys):
         build_parser().parse_args(['--version'])
     assert result.value.code == 0
     assert capsys.readouterr().out.strip() == f'cubic {__version__}'
+
+
+def test_startup_version_with_empty_path_and_outside_checkout(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'tools'))
+    monkeypatch.setenv('PYTHONPATH', str(ROOT / 'src'))
+    from check_install import check_git_free_startup
+
+    assert check_git_free_startup() == {'git_free_startup': 'passed'}

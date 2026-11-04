@@ -20,6 +20,20 @@ TOY_ADAPTER = REPOSITORY / "examples" / "toy_adapter.py"
 
 
 class CLITests(unittest.TestCase):
+    def test_startup_version_does_not_require_git(self):
+        from cubic_serve import __version__
+        from cubic_serve.cli import _serve_model
+
+        args = build_parser().parse_args([
+            "serve", "/checkpoint", "--execution-mode", "eager", "--port", "65536",
+        ])
+        with patch("subprocess.run", side_effect=FileNotFoundError("git")) as run, \
+                patch("cubic_serve.cli._LOGGER.info") as info:
+            with self.assertRaisesRegex(ValueError, "--port must be between"):
+                _serve_model(args)
+        run.assert_not_called()
+        self.assertEqual(info.call_args_list[1].args, ("cubic-serve version=%s", __version__))
+
     def test_serve_and_qualify_help_group_serving_and_development_options(self):
         for command in ("serve", "qualify"):
             output = io.StringIO()
@@ -1002,7 +1016,7 @@ assert signal.getsignal(signal.SIGINT) == original
         startup = info.call_args_list
         self.assertEqual(startup[0].args[0], "startup args=%s")
         self.assertIsInstance(json.loads(startup[0].args[1]), dict)
-        self.assertEqual(startup[1].args[0], "repository version=%s")
+        self.assertEqual(startup[1].args[0], "cubic-serve version=%s")
         self.assertEqual(startup[-6].args[0], "serve endpoint: http://%s:%d")
         self.assertEqual(startup[-5].args, ("serve model: %s", "public-model"))
         self.assertEqual(startup[-4].args, ("serve context: %d tokens (%s)", 8192, "explicit"))
