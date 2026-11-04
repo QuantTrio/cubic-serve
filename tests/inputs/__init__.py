@@ -1,0 +1,1 @@
+"""Encoded input fixture tests."""

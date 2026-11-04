@@ -1,0 +1,58 @@
+name: Package
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install build twine pytest
+      - run: python -m pytest tests/packaging/test_release_pipeline.py -q
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: python tools/check_install.py --wheel dist/*.whl --source-root .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distribution
+          path: dist/*
+
+  install:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist
+      - run: python -m pip install dist/*.whl
+      - run: python -m pip check
+      - name: Check installed package outside checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          cubic --help
+          python "$GITHUB_WORKSPACE/tools/check_install.py"
+      - name: Check Git and clone installation routes
+        if: matrix.python == '3.12'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m pip install --no-deps --force-reinstall "git+file://${GITHUB_WORKSPACE}@${GITHUB_SHA}"
+          python "$GITHUB_WORKSPACE/tools/check_install.py"
+          git clone --depth 1 "file://$GITHUB_WORKSPACE" source-install
+          python -m pip install --no-deps --force-reinstall ./source-install
+          python "$GITHUB_WORKSPACE/tools/check_install.py"

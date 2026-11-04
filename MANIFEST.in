@@ -1,0 +1,8 @@
+global-exclude *
+include README.md pyproject.toml MANIFEST.in
+include docs/installation.md
+include tools/check_install.py
+include tools/build_cuda.py tools/cubic_build_backend.py setup.py
+include tools/build_release.py
+recursive-include src/cubic_serve *.py *.typed *.cu *.cuh *.h *.hpp *.LICENSE LICENSE NOTICE.md manifest.json
+global-exclude __pycache__ *.py[cod] *.so *.o *.a

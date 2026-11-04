@@ -1,0 +1,1 @@
+"""Public protocol projection tests."""
