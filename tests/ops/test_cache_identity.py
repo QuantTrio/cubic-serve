@@ -6,6 +6,40 @@ import torch
 from cubic_serve.ops.cuda import cache_identity as cache
 
 
+def test_vendor_file_hashes_keep_exact_content_identity(monkeypatch, tmp_path):
+    import hashlib
+    import io
+    from pathlib import Path
+
+    from cubic_serve.ops.cuda import compiled_artifact
+
+    binaries = {}
+    for name in ('libcublas', 'libcublasLt'):
+        path = tmp_path / (name + '.so.1')
+        path.write_bytes((name.encode() + b'\x00\xff') * 30000)
+        binaries[name] = path
+    mappings = '\n'.join(f'0000 r-xp 0 00:00 0 {p}' for p in binaries.values())
+    original_open = Path.open
+
+    def open_file(path, *args, **kwargs):
+        if str(path) == '/proc/self/maps':
+            return io.StringIO(mappings)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', open_file)
+    expected = tuple((name, hashlib.blake2s(path.read_bytes()).hexdigest())
+                     for name, path in binaries.items())
+    cache.cuda_libraries.cache_clear()
+    compiled_artifact._mapped_cublas_hashes.cache_clear()
+    try:
+        assert cache.cuda_libraries(tuple(binaries)) == expected
+        assert compiled_artifact._mapped_cublas_hashes() == tuple(
+            (name, 'b2s256:' + digest) for name, digest in expected)
+    finally:
+        cache.cuda_libraries.cache_clear()
+        compiled_artifact._mapped_cublas_hashes.cache_clear()
+
+
 def test_same_gpu_model_reuses_across_uuid_and_cuda_ordinal(monkeypatch, tmp_path):
     monkeypatch.setenv("CUBIC_SERVE_CACHE_DIR", str(tmp_path))
     properties = SimpleNamespace(name="Model A", uuid="physical-0", total_memory=123456,

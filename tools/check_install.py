@@ -178,6 +178,24 @@ def check_git_free_startup() -> dict:
     return {'git_free_startup': 'passed'}
 
 
+def check_file_hashing() -> dict:
+    """Exercise processor metadata hashing, not just import-time compatibility."""
+    from cubic_serve._compat import file_digest
+    from cubic_serve.models.qwen3_5.multimodal import _content_digest_file
+
+    data = b'Cubic processor metadata\x00\xff' * 20000
+    expected = hashlib.blake2s(data).hexdigest()
+    with tempfile.TemporaryDirectory(prefix='cubic-file-hash-') as directory:
+        path = Path(directory) / 'tokenizer.json'
+        path.write_bytes(data)
+        with path.open('rb') as stream:
+            if file_digest(stream, 'blake2s').hexdigest() != expected:
+                raise RuntimeError('Installed file hash differs from content digest')
+        if _content_digest_file(path) != 'b2s256:' + expected:
+            raise RuntimeError('Installed processor metadata hash differs from content digest')
+    return {'file_hashing': 'passed'}
+
+
 def check_installed() -> dict:
     # Keep this set before importing any runtime dependency or walking packages.
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
@@ -195,11 +213,12 @@ def check_installed() -> dict:
     if importlib.metadata.version('cubic-serve') != cubic_serve.__version__:
         raise RuntimeError('Installed metadata and package version differ')
     startup = check_git_free_startup()
+    file_hashing = check_file_hashing()
     files = [p for p in root.rglob('*') if p.is_file() and native_file(p)]
     return {'python': sys.version.split()[0], 'package': str(root),
             'modules_imported': len(imported), 'native_files': len(files),
             'torch': importlib.metadata.version('torch'),
-            'triton': importlib.metadata.version('triton'), **host, **startup}
+            'triton': importlib.metadata.version('triton'), **host, **startup, **file_hashing}
 
 
 def main() -> None:

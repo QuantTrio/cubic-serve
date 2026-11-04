@@ -20,6 +20,8 @@ from torch import Tensor
 from torch.utils.weak import WeakIdKeyDictionary
 from triton.compiler.compiler import CompiledKernel  # type: ignore[import-untyped]
 
+from cubic_serve._compat import file_digest
+
 COMPILED_ARTIFACT_SCHEMA_ID = "cubic.cuda.compiled-artifact.v1"
 ARTIFACT_STAGES = ("ttir", "ttgir", "llir", "ptx", "cubin")
 COMPILER_FLAGS = ("debug", "enable_fp_fusion", "enable_reflect_ftz", "num_ctas", "num_stages",
@@ -392,7 +394,7 @@ def _mapped_cublas_hashes() -> tuple[tuple[str, str], ...]:
     values = []
     for name in VENDOR_BINARIES:
         with paths[name].open("rb") as binary:
-            values.append((name, "b2s256:" + hashlib.file_digest(binary, "blake2s").hexdigest()))
+            values.append((name, "b2s256:" + file_digest(binary, "blake2s").hexdigest()))
     return tuple(values)
 
 

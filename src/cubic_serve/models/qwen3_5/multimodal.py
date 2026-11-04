@@ -22,6 +22,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer  # type: ignore[import-untyped]
 from torch import Tensor
 
+from cubic_serve._compat import file_digest
 from cubic_serve.contracts.model import WeightVariantMeta
 from cubic_serve.contracts.request import (
     CanonicalChatRequest,
@@ -83,7 +84,7 @@ _MESSAGE_METADATA_KEYS = frozenset(
 def _content_digest_file(path: Path) -> str:
     try:
         with path.open("rb") as file:
-            digest = hashlib.file_digest(file, "blake2s").hexdigest()
+            digest = file_digest(file, "blake2s").hexdigest()
     except OSError as error:
         raise ChatProcessorError(f"cannot read processor file {path}: {error}") from error
     return f"b2s256:{digest}"

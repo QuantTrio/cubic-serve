@@ -17,6 +17,7 @@ from types import ModuleType
 import torch
 
 from cubic_serve import cache_root
+from cubic_serve._compat import file_digest
 
 
 def digest(value) -> str:
@@ -76,7 +77,7 @@ def cuda_libraries(names: tuple[str, ...]) -> tuple:
     result = []
     for name in names:
         with paths[name].open("rb") as stream:
-            result.append((name, hashlib.file_digest(stream, "blake2s").hexdigest()))
+            result.append((name, file_digest(stream, "blake2s").hexdigest()))
     return tuple(result)
 
 
