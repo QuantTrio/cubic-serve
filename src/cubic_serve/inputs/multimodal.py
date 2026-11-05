@@ -16,6 +16,23 @@ class EncoderAdmissionError(ChatProcessorError):
     """A media item cannot fit the configured encoder resource budget."""
 
 
+def resolve_encoder_memory_bytes(explicit: int | None, device_bytes: Sequence[int]) -> int:
+    """Choose a per-device encoder envelope, independently of request count.
+
+    Auto uses 5% of the smallest application envelope, with a 1.5 GiB floor
+    capped at a quarter of available memory on small devices. This is a memory
+    policy, not a promise that every model-declared media size fits.
+    """
+    if explicit is not None:
+        return explicit
+    if not device_bytes:
+        return 3 << 29  # CPU/reference callers have no CUDA envelope.
+    available = min(device_bytes)
+    if available <= 0:
+        raise ValueError("input encoders require a positive device envelope")
+    return max(1, min(available // 4, max(3 << 29, available // 20)))
+
+
 @dataclass(frozen=True, slots=True)
 class MultimodalInputPolicy:
     """Resource controls; model processors still own sampling and semantics."""
@@ -63,6 +80,17 @@ class EncoderMemoryBudget:
                 raise RuntimeError("no GPU memory remains for input encoders")
             self.total_bytes = min(free_bytes, self.policy.encoder_memory_bytes)
 
+    def graph_capture_fits(self, *, resident_bytes: int, staging_bytes: int) -> bool:
+        """Keep at least three quarters of the envelope available to input work.
+
+        Check actual retained bytes as well as the pre-capture estimate: native
+        bindings and CUDA graph pools can differ from a tensor inventory.
+        """
+        if self.total_bytes is None:
+            raise RuntimeError("encoder memory budget has not been initialized")
+        return (self.resident_bytes + resident_bytes +
+                max(self.staging_bytes, staging_bytes) <= self.total_bytes // 4)
+
     def capture_capacity(self, *, linear_bytes: int, quadratic_bytes: int,
                          staging_bytes_per_row: int, minimum: int, declared: int,
                          measured_capacity: int = 0, measured_resident_bytes: int = 0) -> int:
@@ -91,7 +119,7 @@ class EncoderMemoryBudget:
             cost = (self.resident_bytes + linear_bytes * capacity +
                     quadratic_bytes * capacity**2 +
                     max(self.staging_bytes, staging_bytes_per_row * capacity))
-            if cost > self.total_bytes:
+            if cost > self.total_bytes // 4:
                 break
             admitted = capacity
             capacity *= 2

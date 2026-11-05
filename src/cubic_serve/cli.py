@@ -446,9 +446,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     multimodal_options = serve_parser.add_argument_group('Multimodal input')
     multimodal_options.add_argument(
-        "--multimodal-memory-gib", dest="multimodal_memory_bytes", type=_parse_positive_gib,
-        default=3 << 29, metavar="GiB",
-        help="Input-encoder graphs and transient input-work sub-budget in GiB (default: 1.5); "
+        "--multimodal-memory-gib", dest="multimodal_memory_bytes", type=_parse_gpu_gib,
+        default="auto", metavar="GiB|auto",
+        help="Input-encoder graphs and transient input-work sub-budget in GiB (default: auto); "
         "encoder weights also consume the global GPU budget",
     )
     multimodal_options.add_argument(
@@ -849,7 +849,7 @@ def _load_serving_vision(args, devices, operator_config, memory_budgets, multimo
                      args.tp_size, encoder_devices)
         vision = factory(
             args.model, parallel=True, devices=encoder_devices, operator_config=operator_config,
-            memory_bytes=args.multimodal_memory_bytes, device_memory_budgets=memory_budgets,
+            memory_bytes=multimodal_policy.encoder_memory_bytes, device_memory_budgets=memory_budgets,
             checkpoint=checkpoint, colocated=colocated, model_config=model_config, **source_options)
         encoder_reserves = vision.input_reserves_by_device
     else:
@@ -859,11 +859,26 @@ def _load_serving_vision(args, devices, operator_config, memory_budgets, multimo
         vision = factory(
             args.model, parallel=False, device=args.device or f"cuda:{devices[0]}",
             operator_config=operator_config,
-            memory_bytes=args.multimodal_memory_bytes, resources=frontend_resources,
+            memory_bytes=multimodal_policy.encoder_memory_bytes, resources=frontend_resources,
             device_memory_budget=memory_budgets.get(frontend_index), checkpoint=checkpoint,
             model_config=model_config, **source_options)
         encoder_reserves = {frontend_index: vision.peak_input_bytes}
     return vision, encoder_reserves
+
+
+def _multimodal_input_policy(args, memory_budgets):
+    from cubic_serve.inputs.multimodal import (
+        MultimodalInputPolicy, resolve_encoder_memory_bytes,
+    )
+    device_bytes = [budget.remaining_bytes(budget.startup.free_bytes)
+                    for budget in memory_budgets.values()]
+    return MultimodalInputPolicy(
+        encoder_memory_bytes=resolve_encoder_memory_bytes(
+            args.multimodal_memory_bytes, device_bytes),
+        preprocess_workers=args.mm_preprocess_workers,
+        feature_cache_bytes=args.mm_feature_cache_bytes,
+        video_frames_per_second=args.video_fps,
+        video_max_frames=args.video_max_frames)
 
 
 def _text_graph_backend(
@@ -873,16 +888,9 @@ def _text_graph_backend(
     """Shared model text graph; each checkpoint binds plain or encoded weights."""
     from cubic_serve.contracts.model import WeightVariantMeta
     from cubic_serve.executor.runner import configure_reference_math
-    from cubic_serve.inputs.multimodal import MultimodalInputPolicy
     from cubic_serve.runtime.quantized_graph import TextGraphExecutor
     from cubic_serve.runtime.token_chat import TokenChatBackend
 
-    multimodal_policy = MultimodalInputPolicy(
-        encoder_memory_bytes=args.multimodal_memory_bytes,
-        preprocess_workers=args.mm_preprocess_workers,
-        feature_cache_bytes=args.mm_feature_cache_bytes,
-        video_frames_per_second=args.video_fps,
-        video_max_frames=args.video_max_frames)
     devices = _parse_devices(args.devices, args.tp_size * args.pp_size)
     import torch
     configure_reference_math()
@@ -890,6 +898,7 @@ def _text_graph_backend(
     frontend_index = (frontend_device.index if frontend_device.index is not None
                       else 0)
     memory_budgets = _device_memory_budgets(args, (*devices, frontend_index))
+    multimodal_policy = _multimodal_input_policy(args, memory_budgets)
     from cubic_serve.models.builtin import (
         admit_builtin_checkpoint,
         admit_model_checkpoint,
@@ -1249,13 +1258,7 @@ def _serve_model(args: argparse.Namespace, *, model_definition_source=None) -> N
                 frontend_index = (frontend.index if frontend.index is not None
                                   else 0)
                 memory_budgets = _device_memory_budgets(args, (*devices, frontend_index))
-            from cubic_serve.inputs.multimodal import MultimodalInputPolicy
-            multimodal_policy = MultimodalInputPolicy(
-                encoder_memory_bytes=args.multimodal_memory_bytes,
-                preprocess_workers=args.mm_preprocess_workers,
-                feature_cache_bytes=args.mm_feature_cache_bytes,
-                video_frames_per_second=args.video_fps,
-                video_max_frames=args.video_max_frames)
+            multimodal_policy = _multimodal_input_policy(args, memory_budgets)
             encoder_reserves = {}
             if args.execution_mode == "cuda":
                 vision, encoder_reserves = _load_serving_vision(

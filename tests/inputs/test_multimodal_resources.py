@@ -11,6 +11,7 @@ from cubic_serve.inputs.multimodal import (
     MultimodalInputPolicy,
     MultimodalPreprocessingGate,
     bounded_encoder_groups,
+    resolve_encoder_memory_bytes,
 )
 
 
@@ -52,8 +53,8 @@ def test_shared_budget_accounts_multiple_encoders_and_reserved_staging():
 
 
 def test_capture_admission_includes_staging_and_other_resident_encoders():
-    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=1000))
-    budget.initialize(2000)
+    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=4000))
+    budget.initialize(8000)
     budget.reserve(resident_bytes=400, staging_bytes=0)
     capacity = budget.capture_capacity(linear_bytes=10, quadratic_bytes=1,
                                        staging_bytes_per_row=10, minimum=4, declared=128)
@@ -76,19 +77,19 @@ def test_dynamic_encoder_item_uses_same_budget_and_exclusive_lease():
 
 @pytest.mark.parametrize("limit,expected", [(1500, 16), (3500, 32)])
 def test_measured_graph_residency_bounds_portfolio_growth(limit, expected):
-    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=limit))
-    budget.initialize(10000)
+    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=limit * 4))
+    budget.initialize(100000)
     # The analytical estimate would admit twice as many rows. Measured sealed
     # bindings/pool residency must stop growth within the existing byte budget.
     assert budget.capture_capacity(linear_bytes=20, quadratic_bytes=1,
                                    staging_bytes_per_row=10, minimum=4, declared=128,
                                    measured_capacity=16,
                                    measured_resident_bytes=16 * 60 + 16**2) == expected
-    assert budget.total_bytes == limit
+    assert budget.total_bytes == limit * 4
 
 
 def test_measured_capture_keeps_other_encoders_and_shared_staging_in_budget():
-    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=2000))
+    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=8000))
     budget.initialize(10000)
     budget.reserve(resident_bytes=400, staging_bytes=200)
     assert budget.capture_capacity(linear_bytes=10, quadratic_bytes=1,
@@ -98,6 +99,45 @@ def test_measured_capture_keeps_other_encoders_and_shared_staging_in_budget():
         budget.capture_capacity(linear_bytes=10, quadratic_bytes=1,
                                 staging_bytes_per_row=10, minimum=4, declared=128,
                                 measured_resident_bytes=1)
+
+
+@pytest.mark.parametrize("device_gib", [20, 24, 32, 48, 80])
+def test_auto_encoder_envelope_obeys_application_memory_and_explicit_override(device_gib):
+    available = device_gib << 30
+    auto = resolve_encoder_memory_bytes(None, [available, available // 2])
+    assert auto == resolve_encoder_memory_bytes(None, [available // 2])
+    assert auto <= available // 8
+    assert resolve_encoder_memory_bytes(4 << 30, [available]) == 4 << 30
+
+
+@pytest.mark.parametrize("budget_bytes", [4 << 30, int(76.464 * (1 << 30)) // 20])
+@pytest.mark.parametrize("rows", [10080, 16544])
+def test_large_image_workspace_survives_worst_admitted_graph_residency(budget_bytes, rows):
+    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=budget_bytes))
+    budget.initialize(80 << 30)
+    # Qwen vision geometry: upload/result + mask + tiled attention + activations.
+    transient = rows * (11264 + 512 * 16 * 8 + 4304 * 16) + rows**2
+    graph_bytes = budget_bytes // 4
+    assert budget.graph_capture_fits(resident_bytes=graph_bytes, staging_bytes=0)
+    assert not budget.graph_capture_fits(resident_bytes=graph_bytes + 1, staging_bytes=0)
+    budget.reserve(resident_bytes=graph_bytes, staging_bytes=0)
+    with budget.lease_dynamic(transient):
+        pass
+
+
+def test_graph_residency_can_explain_wide_image_passing_while_tall_image_fails():
+    budget = EncoderMemoryBudget(MultimodalInputPolicy(encoder_memory_bytes=4 << 30))
+    budget.initialize(80 << 30)
+    old_resident = 7 << 28  # A possible retained portfolio; not an A100 observation.
+    assert not budget.graph_capture_fits(resident_bytes=old_resident, staging_bytes=0)
+    budget.reserve(resident_bytes=old_resident, staging_bytes=0)
+    def transient(rows):
+        return rows * (11264 + 512 * 16 * 8 + 4304 * 16) + rows**2
+    with budget.lease_dynamic(transient(10080)):
+        pass
+    with pytest.raises(EncoderAdmissionError):
+        with budget.lease_dynamic(transient(16544)):
+            pytest.fail("the old graph portfolio left insufficient input working space")
 
 
 @pytest.mark.parametrize("lengths", [[256]*9, [119, 119, 37, 83, 119]])

@@ -333,7 +333,7 @@ print(json.dumps({
             "separate")
         self.assertEqual((defaults.gpu_memory_bytes, defaults.gpu_reserve_bytes,
                           defaults.multimodal_memory_bytes, defaults.mm_feature_cache_bytes),
-                         (None, 1 << 30, 3 << 29, 1 << 28))
+                         (None, 1 << 30, None, 1 << 28))
         args = parser.parse_args(["serve", "/checkpoint", "--gpu-memory-gib", "22",
                                   "--gpu-reserve-gib", "0.5", "--multimodal-memory-gib", "1.5",
                                   "--mm-preprocess-workers", "3", "--mm-feature-cache-gib", "0",
@@ -351,6 +351,23 @@ print(json.dumps({
             for invalid in ("nan", "inf", "-1"):
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     parser.parse_args(["serve", "/checkpoint", flag, invalid])
+
+    def test_auto_encoder_budget_uses_application_limit_not_context_or_request_count(self):
+        from cubic_serve.cli import _multimodal_input_policy
+        from cubic_serve.runtime.cache import DeviceMemoryBudget, DeviceMemorySnapshot
+
+        snapshot = DeviceMemorySnapshot("cuda:0", 80 << 30, 80 << 30)
+        budget = DeviceMemoryBudget(snapshot, 40 << 30, 1 << 30)
+        policies = []
+        for requests, context in ((1, "1024"), (64, "auto"), (256, "32768")):
+            args = build_parser().parse_args([
+                "serve", "/checkpoint", "--max-running-requests", str(requests),
+                "--max-model-len", context,
+            ])
+            policies.append(_multimodal_input_policy(args, {0: budget}))
+        self.assertEqual([p.encoder_memory_bytes for p in policies], [(39 << 30) // 20] * 3)
+        args.multimodal_memory_bytes = 4 << 30
+        self.assertEqual(_multimodal_input_policy(args, {0: budget}).encoder_memory_bytes, 4 << 30)
 
     def test_gpu_budget_seals_math_before_cuda_and_counts_each_physical_device_once(self):
         from cubic_serve.runtime.cache import DeviceMemorySnapshot

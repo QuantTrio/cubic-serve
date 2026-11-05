@@ -837,8 +837,15 @@ at startup; an explicit amount above availability is rejected. Separate GPUs do
 not pool this budget. `--gpu-reserve-gib` (default `1`) remains unallocated inside
 that envelope for runtime work. CUDA Torch allocators are limited before weights
 load, and actual driver-visible residency closes the graph/cache admission.
-`--multimodal-memory-gib` (default `1.5`) is a sub-budget for startup encoder graphs
-and bounded input work, clipped by remaining global headroom. It is an upper
+`--multimodal-memory-gib` (default `auto`) bounds startup encoder graphs and input
+work, clipped by remaining global headroom. Auto uses 5% of the smallest per-device
+application envelope after the runtime reserve, with a 1.5 GiB floor capped at
+25% of that envelope on small devices. Explicit GiB values override this policy.
+Retained graphs plus their staging may occupy at most one quarter of the encoder
+budget; actual capture residency is checked before retaining a bucket. The rest
+remains available for independent larger images/frames through the approved native
+eager encoder path, with admission before TP dispatch. No request-count scaling,
+resource-induced resize, or runtime capture is involved. The budget is an upper
 bound, not a preallocation. Encoder weights also consume the global envelope.
 Positive decimal GiB amounts such as `1.5` and `2.2` are accepted and converted to
 integer bytes; the GPU application budget still defaults to `auto`.

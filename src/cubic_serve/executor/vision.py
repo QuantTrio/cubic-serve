@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -288,6 +289,41 @@ class QwenVisionGraph:
                 self.buckets[capacity] = _VisionBucket(subject, native, capacity, self.stream, pool,
                                                        tp_group)
                 measured_resident = torch.cuda.memory_allocated(device) - resident_before
+                fits = self.resources.graph_capture_fits(
+                    resident_bytes=measured_resident,
+                    staging_bytes=capacity * self.staging_bytes_per_row)
+                if subject.parallel.size > 1:
+                    common.fill_(int(fits))
+                    torch.distributed.all_reduce(common, op=torch.distributed.ReduceOp.MIN,
+                                                 group=tp_group)
+                    fits = bool(common.item())
+                if not fits:
+                    # Retire the last capture on every peer. Its native bindings
+                    # are also retained by subject until explicitly unbound.
+                    self.stream.synchronize()
+                    subject.operators = native
+                    if subject.parallel.size > 1:
+                        subject.reduce = None
+                    rejected = self.buckets.pop(capacity)
+                    rejected.graph.reset()
+                    del rejected
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if not self.buckets:
+                        raise RuntimeError("encoder memory budget cannot admit its minimum graph")
+                    released = self.resources.graph_capture_fits(
+                        resident_bytes=torch.cuda.memory_allocated(device) - resident_before,
+                        staging_bytes=max(self.buckets) * self.staging_bytes_per_row)
+                    if subject.parallel.size > 1:
+                        common.fill_(int(released))
+                        torch.distributed.all_reduce(common, op=torch.distributed.ReduceOp.MIN,
+                                                     group=tp_group)
+                        released = bool(common.item())
+                    if not released:
+                        raise RuntimeError("encoder capture did not release its excess residency")
+                    _LOGGER.info("vision graph portfolio ready device=%s max_patch_tokens=%d",
+                                 device, max(self.buckets))
+                    break
                 maximum = self.resources.capture_capacity(
                     linear_bytes=linear_bytes, quadratic_bytes=quadratic_bytes,
                     staging_bytes_per_row=self.staging_bytes_per_row,
