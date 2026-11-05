@@ -8,10 +8,10 @@ import pytest
 from cubic_serve.inputs.multimodal import (
     EncoderAdmissionError,
     EncoderMemoryBudget,
+    EncoderWorkingSet,
     MultimodalInputPolicy,
     MultimodalPreprocessingGate,
     bounded_encoder_groups,
-    resolve_encoder_memory_bytes,
 )
 
 
@@ -101,13 +101,50 @@ def test_measured_capture_keeps_other_encoders_and_shared_staging_in_budget():
                                 measured_resident_bytes=1)
 
 
-@pytest.mark.parametrize("device_gib", [20, 24, 32, 48, 80])
-def test_auto_encoder_envelope_obeys_application_memory_and_explicit_override(device_gib):
-    available = device_gib << 30
-    auto = resolve_encoder_memory_bytes(None, [available, available // 2])
-    assert auto == resolve_encoder_memory_bytes(None, [available // 2])
-    assert auto <= available // 8
-    assert resolve_encoder_memory_bytes(4 << 30, [available]) == 4 << 30
+def test_auto_encoder_requires_a_model_extent_and_reserves_its_full_working_set():
+    budget = EncoderMemoryBudget(MultimodalInputPolicy())
+    with pytest.raises(ValueError, match="finite model input limit"):
+        budget.initialize(80 << 30)
+    plan = EncoderWorkingSet(65536, 145664, 1, 4)
+    budget.initialize(80 << 30, working_set=plan, graph_bytes=1 << 30)
+    assert budget.total_bytes == (1 << 30) + 13841203200
+    assert budget.graph_limit_bytes == 1 << 30
+    assert plan.fit(budget.total_bytes - budget.graph_limit_bytes) == 65536
+
+
+@pytest.mark.parametrize("available", [1 << 30, 4 << 30, 16 << 30])
+def test_auto_input_extent_closes_against_media_and_language_cache(available):
+    plan = EncoderWorkingSet(65536, 145664, 1, 4)
+    costs = dict(cache_page_bytes=393216, cache_page_tokens=16,
+                 additional_tokens=1024, owner_bytes=16 << 20)
+    rows = plan.fit(available, minimum_rows=2048, **costs)
+    def required(n):
+        tokens = (n + 3) // 4 + 1024
+        return plan.transient_bytes(n) + ((tokens + 15) // 16) * 393216 + (16 << 20)
+    assert required(rows) <= available
+    assert rows % plan.merge_extent == 0
+    assert rows == plan.declared_rows or required(rows + plan.merge_extent) > available
+    assert rows <= plan.fit(available)
+
+
+def test_auto_too_small_for_even_one_graph_and_owner_fails_before_work():
+    plan = EncoderWorkingSet(65536, 145664, 1, 4)
+    with pytest.raises(RuntimeError, match="minimum media input and language cache"):
+        plan.fit(1000, minimum_rows=2048, owner_bytes=2000)
+
+
+def test_media_admission_preserves_cache_pages_after_working_set_subtraction():
+    plan = EncoderWorkingSet(128, 13, 1, 4)
+    page_bytes, page_tokens, dummy_bytes, scratch_pages = 256, 16, 48, 2
+    for available in range(4000, 4300):
+        owner_pool = ((available // page_bytes - scratch_pages) * page_bytes - dummy_bytes)
+        rows = plan.fit(owner_pool, cache_page_bytes=page_bytes,
+                        cache_page_tokens=page_tokens, additional_tokens=1,
+                        owner_bytes=96, working_alignment_bytes=page_bytes)
+        remaining = available - plan.transient_bytes(rows)
+        actual_pool = ((remaining // page_bytes - scratch_pages) * page_bytes - dummy_bytes)
+        tokens = rows // plan.merge_extent + 1
+        assert actual_pool >= ((tokens + page_tokens - 1) // page_tokens) * page_bytes + 96
 
 
 @pytest.mark.parametrize("budget_bytes", [4 << 30, int(76.464 * (1 << 30)) // 20])

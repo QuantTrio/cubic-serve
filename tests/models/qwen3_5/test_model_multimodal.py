@@ -416,3 +416,47 @@ class Qwen3_5DecoderFusionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MediaPixelLimitTests(unittest.TestCase):
+    def test_checkpoint_modern_legacy_and_partial_limits_share_official_defaults(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from cubic_serve.models.qwen3_5.multimodal import qwen_media_pixel_limits
+
+        defaults = {'shortest_edge': 3136, 'longest_edge': 1003520}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'preprocessor_config.json'
+            cases = [
+                ({'size': {'shortest_edge': 65536, 'longest_edge': 16777216}},
+                 (65536, 16777216)),
+                ({'min_pixels': 4096, 'max_pixels': 4194304}, (4096, 4194304)),
+                ({'size': {'longest_edge': 16777216}},
+                 (defaults['shortest_edge'], 16777216)),
+                ({}, (defaults['shortest_edge'], defaults['longest_edge'])),
+            ]
+            for document, expected in cases:
+                path.write_text(json.dumps(document))
+                with self.subTest(document=document):
+                    self.assertEqual(qwen_media_pixel_limits(folder), expected)
+            path.unlink()
+            self.assertEqual(qwen_media_pixel_limits(folder),
+                             (defaults['shortest_edge'], defaults['longest_edge']))
+            self.assertEqual(qwen_media_pixel_limits(folder, video=True), (131072, 786432))
+
+    def test_invalid_limits_do_not_silently_fall_back(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from cubic_serve.models.qwen3_5.multimodal import (
+            Qwen3_5MultimodalError, qwen_media_pixel_limits,
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'preprocessor_config.json'
+            for size in (None, {'shortest_edge': 0, 'longest_edge': 10},
+                         {'shortest_edge': 100, 'longest_edge': 10},
+                         {'shortest_edge': 1, 'longest_edge': True}):
+                path.write_text(json.dumps({'size': size}))
+                with self.subTest(size=size), self.assertRaises(Qwen3_5MultimodalError):
+                    qwen_media_pixel_limits(folder)

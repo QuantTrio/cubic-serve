@@ -867,14 +867,9 @@ def _load_serving_vision(args, devices, operator_config, memory_budgets, multimo
 
 
 def _multimodal_input_policy(args, memory_budgets):
-    from cubic_serve.inputs.multimodal import (
-        MultimodalInputPolicy, resolve_encoder_memory_bytes,
-    )
-    device_bytes = [budget.remaining_bytes(budget.startup.free_bytes)
-                    for budget in memory_budgets.values()]
+    from cubic_serve.inputs.multimodal import MultimodalInputPolicy
     return MultimodalInputPolicy(
-        encoder_memory_bytes=resolve_encoder_memory_bytes(
-            args.multimodal_memory_bytes, device_bytes),
+        encoder_memory_bytes=args.multimodal_memory_bytes,
         preprocess_workers=args.mm_preprocess_workers,
         feature_cache_bytes=args.mm_feature_cache_bytes,
         video_frames_per_second=args.video_fps,

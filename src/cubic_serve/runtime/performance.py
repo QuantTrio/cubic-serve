@@ -5961,6 +5961,7 @@ class _Ready:
     constraint_compound_cost_samples: tuple[tuple[int, int, bool, int, float], ...] = ()
     # Qualified masked sampling tail only: physical rows, greedy, wall ms.
     constraint_sampling_cost_samples: tuple[tuple[int, bool, float], ...] = ()
+    input_encoder_admission: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -9000,6 +9001,10 @@ class _ProcessController:
                 for _, child in encoder_pipes.values():
                     child.close()
             ready = self._receive_ready(startup_timeout_seconds)
+            self.input_encoder_admissions = {
+                item.input_encoder_admission[0]: item.input_encoder_admission[1:]
+                for item in ready if item.input_encoder_admission is not None
+            }
             self._continuation_interrupt.attach(tuple(
                 name for item in ready for name in item.resident_publications
             ))

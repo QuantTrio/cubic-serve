@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-import json
 import logging
 import math
 import os
@@ -24,7 +23,7 @@ import torch
 
 from cubic_serve.executor.runner import configure_reference_math
 from cubic_serve.inputs.multimodal import (
-    EncoderAdmissionError, EncoderMemoryBudget, MultimodalInputPolicy,
+    EncoderAdmissionError, EncoderMemoryBudget, EncoderWorkingSet, MultimodalInputPolicy,
     bounded_encoder_groups,
 )
 from cubic_serve.models.quantized_checkpoint import QuantizedMatrix
@@ -33,6 +32,7 @@ from cubic_serve.models.qwen3_5.multimodal import (
     _position_ids,
     _validate_inputs,
     load_qwen_vision_reference,
+    qwen_media_pixel_limits,
 )
 from cubic_serve.ops.cuda.linear.quantized import PackedLinearOperators, PackedProjectionDispatch
 from cubic_serve.ops.strategies import OperatorConfig, operator_strategy_scope
@@ -41,13 +41,25 @@ from cubic_serve.runtime.cache import DeviceMemoryBudget
 _LOGGER = logging.getLogger(__name__)
 
 
+def _log_input_capacity(plan, rows, requests, residents, reserves):
+    modes = set(requests.values())
+    sizes = [(residents[d] + reserves[d] if requested is None else requested) / (1 << 30)
+             for d, requested in requests.items()]
+    size = (f"{min(sizes):.2f}" if round(min(sizes), 2) == round(max(sizes), 2)
+            else f"{min(sizes):.2f}-{max(sizes):.2f}")
+    _LOGGER.info("--multimodal-memory-gib: %s GiB/GPU%s", size,
+                 " (Auto)" if modes == {None} else "")
+    if rows < plan.declared_rows and plan.pixels_per_row:
+        _LOGGER.info("image capacity: %s pixels", f"{rows * plan.pixels_per_row:,}")
+
+
 def _vision_weight_progress(device, completed, total):
     from cubic_serve.runtime.logging import format_weight_progress
     _LOGGER.info("weights/vision device=%s %s", device,
                  format_weight_progress(completed, total))
 
 
-def load_qwen_vision_graph(model_root, *, device, operator_config=None, memory_bytes=3 << 29,
+def load_qwen_vision_graph(model_root, *, device, operator_config=None, memory_bytes=None,
                            resources=None, device_memory_budget=None, checkpoint=None,
                            tp_size=1, tp_rank=0, tp_group=None, model_config=None):
     configure_reference_math()
@@ -62,8 +74,7 @@ def load_qwen_vision_graph(model_root, *, device, operator_config=None, memory_b
             packed_device="cpu",
             tp_size=tp_size, tp_rank=tp_rank, reduce=reduce if tp_size > 1 else None,
             progress=partial(_vision_weight_progress, device), model_config=model_config)
-        pixel_limit = int(json.loads((root / "preprocessor_config.json").read_text())[
-            "size"]["longest_edge"])
+        _, pixel_limit = qwen_media_pixel_limits(root)
         return QwenVisionGraph(subject, native, memory_bytes=memory_bytes,
                                pixel_limit=pixel_limit, resources=resources,
                                device_memory_budget=device_memory_budget, tp_group=tp_group)
@@ -212,10 +223,11 @@ class _VisionBucket:
 class QwenVisionGraph:
     """One visual encoder lease, with sealed buckets and immutable result copies."""
 
-    def __init__(self, subject, native, *, memory_bytes: int, pixel_limit: int,
+    def __init__(self, subject, native, *, memory_bytes: int | None, pixel_limit: int,
                  resources=None, device_memory_budget: DeviceMemoryBudget | None = None,
                  tp_group=None):
-        if subject.weights.device.type != "cuda" or type(memory_bytes) is not int or memory_bytes <= 0:
+        if subject.weights.device.type != "cuda" or (memory_bytes is not None and (
+                type(memory_bytes) is not int or memory_bytes <= 0)):
             raise ValueError("visual graphs require CUDA and a positive bounded memory share")
         self.config, self.weights = subject.config, subject.weights
         self.input_device = torch.device("cpu")
@@ -233,8 +245,6 @@ class QwenVisionGraph:
             free, _ = torch.cuda.mem_get_info(device)
             available = (device_memory_budget.remaining_bytes(free)
                          if device_memory_budget is not None else free)
-            self.resources.initialize(available)
-            budget = self.resources.total_bytes
             # Bound the whole bucket portfolio, including the sealed native
             # projection operands retained for every capacity. The geometric
             # sum of capacities is less than twice the largest capacity.
@@ -268,10 +278,31 @@ class QwenVisionGraph:
             # shared feature cache are host resident, including queued requests.
             self.staging_bytes_per_row = (
                 width_for(v) * 4 + 4 * v.output_hidden_size // v.spatial_merge_size**2)
+            working_linear = (self.staging_bytes_per_row +
+                              512 * (v.head_count // subject.parallel.size) * 8 +
+                              max(v.hidden_size, v.intermediate_size) * 16)
+            if subject.parallel.size > 1:
+                # Dynamic ordered reductions retain workspaces for the hidden
+                # rows and the merged feature rows until stream completion.
+                working_linear += 4 * (subject.parallel.size + 1) * (
+                    v.hidden_size + v.output_hidden_size // v.spatial_merge_size**2)
+            self.working_set = EncoderWorkingSet(
+                declared, working_linear, 1, v.spatial_merge_size**2, v.patch_size**2)
+            # Capture the native positional grid; independent larger items use
+            # native eager execution. Their full declared working set, rather
+            # than a percentage of VRAM, drives automatic memory reservation.
+            graph_declared = (max(minimum, min(declared, v.position_count))
+                              if memory_bytes is None else declared)
+            anchor = 1 << (graph_declared.bit_length() - 1)
+            graph_estimate = (linear_bytes * anchor + quadratic_bytes * anchor**2 +
+                              self.staging_bytes_per_row * anchor)
+            self.resources.initialize(available, working_set=self.working_set,
+                                      graph_bytes=graph_estimate)
+            budget = self.resources.total_bytes
             maximum = self.resources.capture_capacity(
                 linear_bytes=linear_bytes, quadratic_bytes=quadratic_bytes,
                 staging_bytes_per_row=self.staging_bytes_per_row,
-                minimum=minimum, declared=declared)
+                minimum=minimum, declared=graph_declared)
             if subject.parallel.size > 1:
                 common = torch.tensor(maximum, dtype=torch.int64, device=device)
                 torch.distributed.all_reduce(common, op=torch.distributed.ReduceOp.MIN,
@@ -327,7 +358,7 @@ class QwenVisionGraph:
                 maximum = self.resources.capture_capacity(
                     linear_bytes=linear_bytes, quadratic_bytes=quadratic_bytes,
                     staging_bytes_per_row=self.staging_bytes_per_row,
-                    minimum=minimum, declared=declared,
+                    minimum=minimum, declared=graph_declared,
                     measured_capacity=capacity, measured_resident_bytes=measured_resident)
                 if subject.parallel.size > 1:
                     # All peers finish the same bucket before agreeing whether
@@ -365,20 +396,16 @@ class QwenVisionGraph:
             subject.reduce = _BoundRankSums(tp_group, calibrate_transport=False)
         self.max_patch_tokens = max(self.buckets)
         self.max_input_rows = self.max_patch_tokens
-        declared_rows = pixel_limit // v.patch_size**2
-        low, high = self.max_input_rows, max(self.max_input_rows, declared_rows)
-        while low < high:
-            middle = (low + high + 1) // 2
-            if (self.resources.resident_bytes +
-                    max(self.resources.staging_bytes,
-                        self._eager_transient_bytes(middle)) <= budget):
-                low = middle
-            else:
-                high = middle - 1
+        low = self.working_set.fit(
+            budget - self.resources.resident_bytes, minimum_rows=self.max_input_rows,
+            staging_bytes=self.resources.staging_bytes)
         self.max_dynamic_input_rows = low
         self.peak_input_bytes = (
             self._eager_transient_bytes(low) if low > self.max_input_rows
             else self.resources.staging_bytes)
+        self.auto_memory = memory_bytes is None
+        if self.auto_memory:
+            self.resources.total_bytes = self.resources.resident_bytes + self.peak_input_bytes
         _LOGGER.info("visual graph ready device=%s patch_tokens=%d memory_budget_bytes=%d "
                      "resident_graph_bytes=%d max_dynamic_patch_tokens=%d "
                      "peak_input_bytes=%d "
@@ -386,15 +413,23 @@ class QwenVisionGraph:
                      self.resident_graph_bytes, self.max_dynamic_input_rows,
                      self.peak_input_bytes,
                      native.config.compute_mode, tuple(self.buckets))
+        if not self.auto_memory:
+            self.limit_admission({})
 
     def _eager_transient_bytes(self, rows: int) -> int:
-        v = self.vision_config
-        local_heads = v.head_count // self.subject.parallel.size
-        # One independent frame: upload/result staging, frame mask, 512-row
-        # attention score/probability work, and live layer activations.
-        return (rows * self.staging_bytes_per_row + rows**2 +
-                512 * rows * local_heads * 8 +
-                rows * max(v.hidden_size, v.intermediate_size) * 16)
+        return self.working_set.transient_bytes(rows)
+
+    def limit_admission(self, limits):
+        device = self.weights.device.index
+        if device in limits:
+            rows, peak = limits[device]
+            self.max_dynamic_input_rows = min(rows, self.max_dynamic_input_rows)
+            self.peak_input_bytes = min(peak, self.peak_input_bytes)
+            self.resources.total_bytes = self.resources.resident_bytes + self.peak_input_bytes
+        _log_input_capacity(
+            self.working_set, self.max_dynamic_input_rows,
+            {device: self.resources.policy.encoder_memory_bytes},
+            {device: self.resident_graph_bytes}, {device: self.peak_input_bytes})
 
     @torch.inference_mode()
     def forward(self, pixel_values, grid_thw):
@@ -524,6 +559,20 @@ def serve_input_encoder(encoder, connection, rank):
         connection.send(("complete", features.shape[0]))
 
 
+def _encoder_ready(encoder):
+    ready = ("ready", encoder.max_input_rows, encoder.resources.staging_bytes,
+             encoder.resident_graph_bytes, encoder.max_dynamic_input_rows,
+             encoder.peak_input_bytes)
+    if hasattr(encoder, "working_set"):
+        ready += (encoder.working_set, encoder.resources.policy.encoder_memory_bytes)
+    return ready
+
+
+def publish_owned_input_encoder(owned, admission):
+    if owned is not None and getattr(owned[0], "auto_memory", False):
+        admission.input_encoder_connection.send(_encoder_ready(owned[0]))
+
+
 def prepare_owned_input_encoder(admission, *, topology, rank, device):
     """Bind the input factory to first-stage workers without changing LM groups."""
     factory = getattr(admission, "input_encoder_factory", None)
@@ -542,10 +591,8 @@ def prepare_owned_input_encoder(admission, *, topology, rank, device):
     local_rank = torch.distributed.get_group_rank(group, rank)
     encoder = factory(device=device, tp_rank=local_rank, tp_group=group)
     admission.input_encoder_reserves[device.index] = encoder.peak_input_bytes
-    admission.input_encoder_connection.send((
-        "ready", encoder.max_input_rows, encoder.resources.staging_bytes,
-        encoder.resident_graph_bytes, encoder.max_dynamic_input_rows,
-        encoder.peak_input_bytes))
+    if not getattr(encoder, "auto_memory", False):
+        admission.input_encoder_connection.send(_encoder_ready(encoder))
     return encoder, local_rank
 
 
@@ -610,9 +657,7 @@ def _encoder_rank(metadata_path, rank, device_index, connection, init_method, wo
         _LOGGER.info("vision worker initialized rank=%d metadata_bytes=%d duration_s=%.3f",
                      rank, Path(metadata_path).stat().st_size, time.perf_counter() - started)
         encoder = factory(device=device, tp_rank=rank, tp_group=torch.distributed.group.WORLD)
-        connection.send(("ready", encoder.max_input_rows, encoder.resources.staging_bytes,
-                         encoder.resident_graph_bytes, encoder.max_dynamic_input_rows,
-                         encoder.peak_input_bytes))
+        connection.send(_encoder_ready(encoder))
         serve_input_encoder(encoder, connection, rank)
     except BaseException:
         with suppress(OSError, EOFError):
@@ -721,6 +766,15 @@ class InputEncoderGroup:
             d: (r[5] if len(r) > 5 else r[2])
             for d, r in zip(self.devices, ready, strict=True)
         }
+        self.working_sets_by_device = {
+            device: (item[6], item[1], item[2])
+            for device, item in zip(self.devices, ready, strict=True)
+            if len(item) > 7 and item[7] is None
+        }
+        self._memory_requests = {d: r[7] for d, r in zip(self.devices, ready, strict=True)
+                                 if len(r) > 7}
+        self._memory_residents = {d: r[3] for d, r in zip(self.devices, ready, strict=True)}
+        self._working_set = next((r[6] for r in ready if len(r) > 7), None)
         self._pixels = torch.empty(self.max_input_rows, self._input_width, device="cpu").share_memory_()
         self._output = torch.empty(self.max_input_rows // self._merge_extent, self._output_width,
                                    dtype=torch.bfloat16, device="cpu").share_memory_()
@@ -729,6 +783,22 @@ class InputEncoderGroup:
         _LOGGER.info("input encoder ready module=%s parallelism=tp tp_size=%d "
                      "devices=%s input_rows=%d colocated=%s", self._module, len(self.devices),
                      self.devices, self.max_input_rows, self.colocated)
+        if self.colocated or not self.working_sets_by_device:
+            self.limit_admission({})
+
+    def limit_admission(self, limits):
+        """Apply the final per-device language/encoder memory agreement."""
+        selected = [limits[d] for d in self.devices if d in limits]
+        if selected:
+            self.max_dynamic_input_rows = min(self.max_dynamic_input_rows,
+                                              *(item[0] for item in selected))
+            for device in self.devices:
+                if device in limits:
+                    self.input_reserves_by_device[device] = limits[device][1]
+        plan = getattr(self, "_working_set", None)
+        if plan is not None:
+            _log_input_capacity(plan, self.max_dynamic_input_rows, self._memory_requests,
+                                self._memory_residents, self.input_reserves_by_device)
 
     def _receive(self, rank, expected):
         deadline = time.monotonic() + self._timeout
@@ -837,7 +907,7 @@ def _load_qwen_encoder_rank(*, device, tp_rank, tp_group, model_root, checkpoint
         tp_size=tp_size, tp_rank=tp_rank, tp_group=tp_group, model_config=model_config)
 
 
-def load_qwen_vision_tp(model_root, *, devices, operator_config=None, memory_bytes=3 << 29,
+def load_qwen_vision_tp(model_root, *, devices, operator_config=None, memory_bytes=None,
                         device_memory_budgets=None, checkpoint=None, colocated=False,
                         model_config=None, model_definition_source=None):
     """The model's common visual graph follows the serving tensor group."""

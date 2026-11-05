@@ -1119,6 +1119,32 @@ def _smart_resize(
     return resized_height, resized_width
 
 
+def qwen_media_pixel_limits(model_root, *, video=False) -> tuple[int, int]:
+    """Resolve the same checkpoint/official processor bounds for sizing and input."""
+    filename = "video_preprocessor_config.json" if video else "preprocessor_config.json"
+    path = Path(model_root) / filename
+    document = json.loads(path.read_bytes()) if path.exists() else {}
+    size = document.get("size", {})
+    if not isinstance(size, dict):
+        raise Qwen3_5MultimodalError("Qwen media processor size must be an object")
+    minimum = document.get("min_pixels", size.get("shortest_edge"))
+    maximum = document.get("max_pixels", size.get("longest_edge"))
+    if minimum is None or maximum is None:
+        # Model-owned defaults from the official Qwen2VLImageProcessor and
+        # Qwen3VLVideoProcessor. Reading two scalar limits must not require
+        # TorchVision or initialize an additional processor/backend.
+        if video:
+            defaults = {"shortest_edge": 128 * 32 * 32, "longest_edge": 768 * 32 * 32}
+        else:
+            defaults = {"shortest_edge": 56 * 56, "longest_edge": 1280 * 28 * 28}
+        minimum = defaults["shortest_edge"] if minimum is None else minimum
+        maximum = defaults["longest_edge"] if maximum is None else maximum
+    if (type(minimum) is not int or type(maximum) is not int or
+            minimum <= 0 or maximum < minimum):
+        raise Qwen3_5MultimodalError("Qwen media processor pixel limits are invalid")
+    return minimum, maximum
+
+
 class Qwen3_5MultimodalProcessor:
     """Resolve public image/video parts into the existing trusted Qwen bridge."""
 
@@ -1145,16 +1171,8 @@ class Qwen3_5MultimodalProcessor:
             allowed_local_media_path=allowed_local_media_path,
             video_fps=policy.video_frames_per_second, max_frames=policy.video_max_frames)
         try:
-            image = json.loads((root / "preprocessor_config.json").read_bytes())
-            video = json.loads((root / "video_preprocessor_config.json").read_bytes())
-            self._image_pixels = (
-                int(image["size"]["shortest_edge"]),
-                int(image["size"]["longest_edge"]),
-            )
-            self._video_pixels = (
-                int(video["size"]["shortest_edge"]),
-                int(video["size"]["longest_edge"]),
-            )
+            self._image_pixels = qwen_media_pixel_limits(root)
+            self._video_pixels = qwen_media_pixel_limits(root, video=True)
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise Qwen3_5MultimodalError("Qwen media processor config is invalid") from error
 

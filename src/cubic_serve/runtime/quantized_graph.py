@@ -300,6 +300,7 @@ def _worker(
     from cubic_serve.executor.vision import (
         finish_owned_input_encoder,
         prepare_owned_input_encoder,
+        publish_owned_input_encoder,
         start_owned_input_encoder,
     )
     try:
@@ -394,6 +395,7 @@ def _worker(
         with startup_cuda_lock(device):
             owned_encoder = prepare_owned_input_encoder(
                 admission, topology=topology, rank=rank, device=device)
+        input_encoder_admission = None
         # Engineering timing must exclude reader CPU/host traffic. Ordinary
         # startup restores plans without searching/timing candidates, so its
         # private constructor can consume ready operands while the reader runs.
@@ -902,15 +904,67 @@ def _worker(
             # Input encoders can execute in the frontend process while language
             # requests decode. Their unallocated staging capacity is additional to
             # the language runtime reserve, and follows physical device ownership.
-            reserve += admission.input_encoder_reserves.get(placement.device_index, 0)
             schemas = ((spec,layout),) if draft_spec is None else ((spec,layout),(draft_spec,draft_layout))
+            page_layout,state_layout = SharedCacheStorage.layouts(schemas,extra_state_fields)
+            encoder = None if owned_encoder is None else owned_encoder[0]
+            auto_encoder = encoder is not None and getattr(encoder, "auto_memory", False)
+            encoder_plan = ((encoder.working_set, encoder.max_input_rows,
+                             encoder.resources.staging_bytes) if auto_encoder else
+                            getattr(admission, "input_encoder_working_sets", {}).get(
+                                placement.device_index))
+            media_available = SharedCacheStorage.budget_from_available(
+                min(free, memory_budget.startup.free_bytes) - reserve -
+                graph_bytes - transient_bytes, schemas, extra_state_fields)
+            media_owner_states = (1 + admission.max_speculative_tokens +
+                                  int(admission.use_prefix_cache))
+            if encoder_plan is not None:
+                plan, minimum_rows, staging_bytes = encoder_plan
+            merge_extent = torch.tensor(0 if encoder_plan is None else plan.merge_extent,
+                                        dtype=torch.int64, device=device)
+            all_reduce(merge_extent, op=dist.ReduceOp.MAX)
+            media_merge_extent = int(merge_extent.item())
+
+            def admit_media(available_bytes):
+                nonlocal input_encoder_admission
+                encoder_rows = (1 << 62)
+                owner_bytes = (0 if state_layout is None else
+                               media_owner_states * state_layout.entry_bytes)
+                if encoder_plan is not None:
+                    encoder_rows = plan.fit(
+                        available_bytes, minimum_rows=minimum_rows, staging_bytes=staging_bytes,
+                        cache_page_bytes=page_layout.entry_bytes, cache_page_tokens=page_size,
+                        additional_tokens=maximum, owner_bytes=owner_bytes,
+                        working_alignment_bytes=page_layout.entry_bytes)
+                elif media_merge_extent:
+                    # Stages without an encoder still need KV for its features.
+                    encoder_rows = (((available_bytes - owner_bytes) // page_layout.entry_bytes
+                                     * page_size - maximum) * media_merge_extent)
+                agreed_rows = torch.tensor(encoder_rows, dtype=torch.int64, device=device)
+                all_reduce(agreed_rows, op=dist.ReduceOp.MIN)
+                if encoder_plan is not None:
+                    rows = min(int(agreed_rows.item()), plan.declared_rows)
+                    rows = rows // plan.merge_extent * plan.merge_extent
+                    if rows < minimum_rows:
+                        raise ValueError("insufficient topology cache for the minimum media input")
+                    if auto_encoder:
+                        rows = min(rows, encoder.max_dynamic_input_rows)
+                        encoder.max_dynamic_input_rows = rows
+                        encoder.peak_input_bytes = max(staging_bytes, plan.transient_bytes(rows))
+                        encoder.resources.total_bytes = (encoder.resources.resident_bytes +
+                                                         encoder.peak_input_bytes)
+                    peak = max(staging_bytes, plan.transient_bytes(rows))
+                    admission.input_encoder_reserves[placement.device_index] = peak
+                    input_encoder_admission = (placement.device_index, rows, peak)
+
+            admit_media(media_available)
+            reserve += admission.input_encoder_reserves.get(placement.device_index, 0)
             pool_budget = SharedCacheStorage.budget_from_available(
                 min(free,memory_budget.startup.free_bytes)-reserve-graph_bytes-transient_bytes,
                 schemas,extra_state_fields)
-            page_layout,state_layout = SharedCacheStorage.layouts(schemas,extra_state_fields)
             combined_page_bytes = page_layout.entry_bytes
             state_bytes = 0 if state_layout is None else state_layout.entry_bytes
             common = torch.empty(2,dtype=torch.int64,device=device)
+            allocation_correction = 0
             while True:
                 if pool_budget < combined_page_bytes or state_bytes > pool_budget:
                     raise ValueError("insufficient shared KV/state byte capacity")
@@ -942,11 +996,17 @@ def _worker(
                 correction = int(common[0].item())
                 if not correction:
                     break
-                # Cross measured allocator segment plateaus; every correction
-                # strictly decreases bytes and never changes owner arithmetic.
+                # Reconcile media and KV against actual allocator plateaus.
+                # Every correction decreases their total admitted byte envelope.
                 arena=draft_arena=target_hidden_slots=shared_storage=None
                 gc.collect();torch.cuda.empty_cache()
-                pool_budget -= (correction+15)//16*16
+                allocation_correction += (correction+15)//16*16
+                admit_media(media_available - allocation_correction)
+                reserve = (memory_budget.withheld_bytes +
+                           admission.input_encoder_reserves.get(placement.device_index, 0))
+                pool_budget = SharedCacheStorage.budget_from_available(
+                    min(free, memory_budget.startup.free_bytes) - reserve - graph_bytes -
+                    transient_bytes, schemas, extra_state_fields) - allocation_correction
             spec=arena.spec
             if draft_arena is not None:draft_spec=draft_arena.spec
             # Context must fit one live request plus its actual checkpoint/COW
@@ -961,6 +1021,11 @@ def _worker(
             max_context = _effective_max_sequence_tokens(
                 admission.max_sequence_tokens,int(common[0].item()),maximum,
                 block_size=page_size, scratch_pages=0)
+            if input_encoder_admission is not None:
+                image_tokens = ((input_encoder_admission[1] + plan.merge_extent - 1)
+                                // plan.merge_extent)
+                if image_tokens + maximum > int(common[0].item()) * page_size:
+                    raise ValueError("admitted media exceeds its physical language context")
             if not admission.auto_max_sequence_tokens and max_context != admission.max_sequence_tokens:
                 raise ValueError("requested context exceeds shared KV/state capacity")
             admission.max_sequence_tokens=max_context
@@ -1409,6 +1474,7 @@ def _worker(
                 // combined_page_bytes
             ),
         )
+        publish_owned_input_encoder(owned_encoder, admission)
         encoder_thread = start_owned_input_encoder(
             owned_encoder, getattr(admission, "input_encoder_connection", None),
             lambda failure: results.send(_Failure(rank, None, failure)))
@@ -1442,6 +1508,7 @@ def _worker(
                 proposal_cost_samples,
                 target_depth_samples=target_depth_samples,
                 constraint_sampling_cost_samples=constraint_sampling_cost_samples,
+                input_encoder_admission=input_encoder_admission,
                 compound_cost_samples=(
                     tuple((rows, round_.depth + 1, greedy, _median_cost_samples(values))
                           for (_review, _depth), round_ in sorted(draft_rounds.items())
@@ -1874,6 +1941,14 @@ class TextGraphExecutor:
         )
         if cache_storage is not None:
             admission.cache_storage = cache_storage
+        admission.input_encoder_working_sets = getattr(
+            input_encoder, "working_sets_by_device", {})
+        if (input_encoder is not None and getattr(input_encoder, "auto_memory", False)
+                and not admission.input_encoder_working_sets):
+            admission.input_encoder_working_sets = {
+                input_encoder.weights.device.index: (
+                    input_encoder.working_set, input_encoder.max_input_rows,
+                    input_encoder.resources.staging_bytes)}
         if model_definition_source is not None:
             admission.model_definition_source = model_definition_source
             admission.model_program_recipe = model_definition_source.execution_recipe(config)
@@ -1898,6 +1973,9 @@ class TextGraphExecutor:
             graph_capacities=capacities,
             encoder_group=colocated_encoder,
         )
+        if (input_encoder is not None and colocated_encoder is None
+                and self._controller.input_encoder_admissions):
+            input_encoder.limit_admission(self._controller.input_encoder_admissions)
         if colocated_encoder is not None:
             try:
                 colocated_encoder.attach_main_workers(

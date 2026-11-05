@@ -352,7 +352,7 @@ print(json.dumps({
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     parser.parse_args(["serve", "/checkpoint", flag, invalid])
 
-    def test_auto_encoder_budget_uses_application_limit_not_context_or_request_count(self):
+    def test_auto_encoder_budget_is_deferred_to_model_not_context_or_request_count(self):
         from cubic_serve.cli import _multimodal_input_policy
         from cubic_serve.runtime.cache import DeviceMemoryBudget, DeviceMemorySnapshot
 
@@ -365,7 +365,7 @@ print(json.dumps({
                 "--max-model-len", context,
             ])
             policies.append(_multimodal_input_policy(args, {0: budget}))
-        self.assertEqual([p.encoder_memory_bytes for p in policies], [(39 << 30) // 20] * 3)
+        self.assertEqual([p.encoder_memory_bytes for p in policies], [None] * 3)
         args.multimodal_memory_bytes = 4 << 30
         self.assertEqual(_multimodal_input_policy(args, {0: budget}).encoder_memory_bytes, 4 << 30)
 

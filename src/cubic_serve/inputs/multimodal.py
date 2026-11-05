@@ -16,35 +16,75 @@ class EncoderAdmissionError(ChatProcessorError):
     """A media item cannot fit the configured encoder resource budget."""
 
 
-def resolve_encoder_memory_bytes(explicit: int | None, device_bytes: Sequence[int]) -> int:
-    """Choose a per-device encoder envelope, independently of request count.
+@dataclass(frozen=True, slots=True)
+class EncoderWorkingSet:
+    """Model-declared independent input extent and per-rank device byte costs."""
 
-    Auto uses 5% of the smallest application envelope, with a 1.5 GiB floor
-    capped at a quarter of available memory on small devices. This is a memory
-    policy, not a promise that every model-declared media size fits.
-    """
-    if explicit is not None:
-        return explicit
-    if not device_bytes:
-        return 3 << 29  # CPU/reference callers have no CUDA envelope.
-    available = min(device_bytes)
-    if available <= 0:
-        raise ValueError("input encoders require a positive device envelope")
-    return max(1, min(available // 4, max(3 << 29, available // 20)))
+    declared_rows: int
+    linear_bytes: int
+    quadratic_bytes: int
+    merge_extent: int
+    pixels_per_row: int = 0
+
+    def __post_init__(self):
+        if any(type(value) is not int or value <= 0 for value in (
+                self.declared_rows, self.linear_bytes, self.merge_extent)):
+            raise ValueError("auto encoder memory requires a finite positive model input limit")
+        if type(self.quadratic_bytes) is not int or self.quadratic_bytes < 0:
+            raise ValueError("encoder quadratic byte cost must be non-negative")
+        if self.declared_rows < self.merge_extent:
+            raise ValueError("encoder input limit cannot hold one merged output")
+
+    def transient_bytes(self, rows: int) -> int:
+        return self.linear_bytes * rows + self.quadratic_bytes * rows**2
+
+    def fit(self, available_bytes: int, *, minimum_rows: int = 1,
+            staging_bytes: int = 0, cache_page_bytes: int = 0,
+            cache_page_tokens: int = 1, additional_tokens: int = 0,
+            owner_bytes: int = 0, working_alignment_bytes: int = 1) -> int:
+        """Largest declared extent after reserving its language-cache footprint."""
+        if minimum_rows <= 0 or cache_page_tokens <= 0 or working_alignment_bytes <= 0 or min(
+                staging_bytes, cache_page_bytes, additional_tokens, owner_bytes) < 0:
+            raise ValueError("encoder admission costs and extents must be valid")
+        minimum_rows = ((minimum_rows + self.merge_extent - 1) // self.merge_extent
+                        * self.merge_extent)
+        if minimum_rows > self.declared_rows:
+            raise ValueError("encoder minimum rows exceed the declared input limit")
+        def required(rows):
+            tokens = (rows + self.merge_extent - 1) // self.merge_extent + additional_tokens
+            cache = ((tokens + cache_page_tokens - 1) // cache_page_tokens
+                     * cache_page_bytes + owner_bytes)
+            working = max(staging_bytes, self.transient_bytes(rows))
+            # Subtracting a page-aligned working reservation commutes with
+            # rounding the remaining shared-cache byte pool down to pages.
+            working = ((working + working_alignment_bytes - 1) // working_alignment_bytes
+                       * working_alignment_bytes)
+            return working + cache
+        if required(minimum_rows) > available_bytes:
+            raise RuntimeError("insufficient memory for the minimum media input and language cache")
+        low, high = minimum_rows, self.declared_rows
+        while low < high:
+            middle = (low + high + 1) // 2
+            if required(middle) <= available_bytes:
+                low = middle
+            else:
+                high = middle - 1
+        return low // self.merge_extent * self.merge_extent
 
 
 @dataclass(frozen=True, slots=True)
 class MultimodalInputPolicy:
     """Resource controls; model processors still own sampling and semantics."""
 
-    encoder_memory_bytes: int = 3 << 29
+    encoder_memory_bytes: int | None = None
     preprocess_workers: int = 2
     feature_cache_bytes: int = 256 << 20
     video_frames_per_second: float = 2.0
     video_max_frames: int = 768
 
     def __post_init__(self):
-        if type(self.encoder_memory_bytes) is not int or self.encoder_memory_bytes <= 0:
+        if self.encoder_memory_bytes is not None and (
+                type(self.encoder_memory_bytes) is not int or self.encoder_memory_bytes <= 0):
             raise ValueError("multimodal memory budget must be positive integer bytes")
         if type(self.preprocess_workers) is not int or self.preprocess_workers <= 0:
             raise ValueError("multimodal preprocess workers must be a positive integer")
@@ -72,16 +112,27 @@ class EncoderMemoryBudget:
         self.total_bytes: int | None = None
         self.resident_bytes = 0
         self.staging_bytes = 0
+        self.graph_limit_bytes: int | None = None
         self._lock = threading.Lock()
 
-    def initialize(self, free_bytes: int):
+    def initialize(self, free_bytes: int, *, working_set: EncoderWorkingSet | None = None,
+                   graph_bytes: int = 0):
         if self.total_bytes is None:
             if type(free_bytes) is not int or free_bytes <= 0:
                 raise RuntimeError("no GPU memory remains for input encoders")
-            self.total_bytes = min(free_bytes, self.policy.encoder_memory_bytes)
+            if self.policy.encoder_memory_bytes is None:
+                if working_set is None:
+                    raise ValueError("auto encoder memory requires a finite model input limit; "
+                                     "set --multimodal-memory-gib explicitly")
+                self.graph_limit_bytes = min(graph_bytes, free_bytes)
+                self.total_bytes = min(free_bytes, graph_bytes +
+                                       working_set.transient_bytes(working_set.declared_rows))
+            else:
+                self.total_bytes = min(free_bytes, self.policy.encoder_memory_bytes)
+                self.graph_limit_bytes = self.total_bytes // 4
 
     def graph_capture_fits(self, *, resident_bytes: int, staging_bytes: int) -> bool:
-        """Keep at least three quarters of the envelope available to input work.
+        """Keep retained graphs within their reserved share of the encoder budget.
 
         Check actual retained bytes as well as the pre-capture estimate: native
         bindings and CUDA graph pools can differ from a tensor inventory.
@@ -89,7 +140,7 @@ class EncoderMemoryBudget:
         if self.total_bytes is None:
             raise RuntimeError("encoder memory budget has not been initialized")
         return (self.resident_bytes + resident_bytes +
-                max(self.staging_bytes, staging_bytes) <= self.total_bytes // 4)
+                max(self.staging_bytes, staging_bytes) <= self.graph_limit_bytes)
 
     def capture_capacity(self, *, linear_bytes: int, quadratic_bytes: int,
                          staging_bytes_per_row: int, minimum: int, declared: int,
@@ -119,7 +170,7 @@ class EncoderMemoryBudget:
             cost = (self.resident_bytes + linear_bytes * capacity +
                     quadratic_bytes * capacity**2 +
                     max(self.staging_bytes, staging_bytes_per_row * capacity))
-            if cost > self.total_bytes // 4:
+            if cost > self.graph_limit_bytes:
                 break
             admitted = capacity
             capacity *= 2

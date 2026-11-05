@@ -838,15 +838,23 @@ not pool this budget. `--gpu-reserve-gib` (default `1`) remains unallocated insi
 that envelope for runtime work. CUDA Torch allocators are limited before weights
 load, and actual driver-visible residency closes the graph/cache admission.
 `--multimodal-memory-gib` (default `auto`) bounds startup encoder graphs and input
-work, clipped by remaining global headroom. Auto uses 5% of the smallest per-device
-application envelope after the runtime reserve, with a 1.5 GiB floor capped at
-25% of that envelope on small devices. Explicit GiB values override this policy.
-Retained graphs plus their staging may occupy at most one quarter of the encoder
-budget; actual capture residency is checked before retaining a bucket. The rest
-remains available for independent larger images/frames through the approved native
-eager encoder path, with admission before TP dispatch. No request-count scaling,
-resource-induced resize, or runtime capture is involved. The budget is an upper
-bound, not a preallocation. Encoder weights also consume the global envelope.
+work. Auto targets the checkpoint processor's declared maximum independent input,
+using the model processor's official defaults when metadata omits those limits.
+Without any finite model/processor limit, automatic sizing fails explicitly and
+requires an explicit memory budget. Native positional-grid graphs and per-rank
+activation, attention-mask and TP reduction workspaces are accounted separately;
+automatic input capacity is not a percentage of VRAM. Before allocating KV/state,
+admission closes against measured language-graph memory and reserves enough cache
+to represent the admitted media plus a graph-sized text chunk and owner state.
+If the complete model input limit cannot fit, auto lowers the input limit and logs
+the admitted pixel area. Startup reports the effective encoder envelope as
+`--multimodal-memory-gib: X GiB/GPU (Auto)`, omitting `(Auto)` for an explicit
+override. Request count, context flags
+and MTP do not select a media resolution; MTP's actual runtime allocations enter
+the remaining-memory calculation. Explicit GiB values retain their bounded graph
+share and admit the input sizes that fit. Larger independent items use the native
+eager encoder after admission before TP dispatch. No resource-induced resize or
+runtime capture is involved. Encoder weights also consume the global envelope.
 Positive decimal GiB amounts such as `1.5` and `2.2` are accepted and converted to
 integer bytes; the GPU application budget still defaults to `auto`.
 Weights and resident graphs remain visible to decoder KV sizing. The startup

@@ -13,6 +13,7 @@ import torch
 
 from cubic_serve.executor import vision
 from cubic_serve.models.loader import load_model_definition
+from cubic_serve.inputs.multimodal import EncoderWorkingSet
 
 ENTRY = '''from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -158,3 +159,39 @@ def test_colocated_source_recipe_mismatch_fails_before_group_or_factory(tmp_path
             vision.prepare_owned_input_encoder(admission, topology=None, rank=0, device=None)
         group.assert_not_called()
         admission.input_encoder_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("requested", [None, 4 << 30])
+def test_memory_log_uses_launch_flag_and_reports_effective_bytes(caplog, requested):
+    plan = EncoderWorkingSet(65536, 145664, 1, 4, 256)
+    with caplog.at_level("INFO", logger=vision.__name__):
+        vision._log_input_capacity(plan, 65536, {0: requested},
+                                   {0: 1 << 28}, {0: (4 << 30) - (1 << 28)})
+    expected = "--multimodal-memory-gib: 4.00 GiB/GPU"
+    if requested is None:
+        expected += " (Auto)"
+    assert caplog.messages == [expected]
+
+
+def test_explicit_memory_log_retains_requested_envelope(caplog):
+    plan = EncoderWorkingSet(65536, 145664, 1, 4, 256)
+    with caplog.at_level("INFO", logger=vision.__name__):
+        vision._log_input_capacity(plan, 65536, {0: 16 << 30},
+                                   {0: 1 << 28}, {0: 13 << 30})
+    assert caplog.messages == ["--multimodal-memory-gib: 16.00 GiB/GPU"]
+
+
+def test_final_frontend_limit_uses_smallest_rank_and_reports_reduced_area(caplog):
+    plan = EncoderWorkingSet(65536, 145664, 1, 4, 256)
+    group = SimpleNamespace(
+        devices=(0, 1), max_dynamic_input_rows=65536,
+        input_reserves_by_device={0: 13 << 30, 1: 13 << 30},
+        _memory_requests={0: None, 1: None},
+        _memory_residents={0: 1 << 28, 1: 1 << 28}, _working_set=plan,
+    )
+    with caplog.at_level("INFO", logger=vision.__name__):
+        vision.InputEncoderGroup.limit_admission(group, {0: (32768, 2 << 30),
+                                                        1: (16384, 1 << 30)})
+    assert group.max_dynamic_input_rows == 16384
+    assert group.input_reserves_by_device == {0: 2 << 30, 1: 1 << 30}
+    assert caplog.messages[-1] == "image capacity: 4,194,304 pixels"
