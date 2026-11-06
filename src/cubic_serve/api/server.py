@@ -39,7 +39,9 @@ ASGIMessage = dict[str, object]
 ASGIScope = Mapping[str, object]
 ASGIReceive = Callable[[], Awaitable[ASGIMessage]]
 ASGISend = Callable[[ASGIMessage], Awaitable[None]]
-MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+# Aggregate wire limit, including base64 expansion and JSON. Individual media
+# retain their independent encoded-byte and decoded-pixel admission limits.
+MAX_JSON_BODY_BYTES = 64 * 1024 * 1024
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.INFO)
 
@@ -289,10 +291,10 @@ async def _read_body(receive: ASGIReceive) -> bytes:
         if type(chunk) is not bytes or type(raw_more) is not bool:
             raise _InputError(400, "invalid ASGI request body fields",
                               public_message="invalid request body")
-        result.extend(chunk)
-        if len(result) > MAX_JSON_BODY_BYTES:
-            raise _InputError(413, "request JSON body exceeds the 2 MiB limit",
+        if len(result) + len(chunk) > MAX_JSON_BODY_BYTES:
+            raise _InputError(413, f"request JSON body exceeds the {MAX_JSON_BODY_BYTES}-byte limit",
                               public_message="request body is too large")
+        result.extend(chunk)
         more = raw_more
     return bytes(result)
 

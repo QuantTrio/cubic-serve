@@ -30,6 +30,27 @@ def _request(part: dict[str, object]):
     return request
 
 
+class ImageResolverTests(unittest.TestCase):
+    def test_image_format_is_detected_from_bytes_for_inline_and_local_inputs(self):
+        data = base64.b64decode(_PNG)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.jpeg"
+            path.write_bytes(data)
+            resolver = MediaResolver(allowed_local_media_path=directory)
+            for uri in (f"data:image/jpeg;base64,{_PNG}", path.as_uri()):
+                with self.subTest(uri=uri):
+                    result = resolver.realize(_request(
+                        {"type": "image_url", "image_url": {"url": uri}}))[0]
+                    self.assertEqual(result.part.media.mime_type, "image/png")
+                    self.assertEqual(tuple(result.frames.shape), (1, 32, 32, 3))
+
+    def test_invalid_image_bytes_still_fail_decode(self):
+        request = _request({"type": "image_url", "image_url": {
+            "url": "data:image/jpeg;base64," + base64.b64encode(b"not an image").decode()}})
+        with self.assertRaisesRegex(ChatProcessorError, "could not be decoded"):
+            MediaResolver().realize(request)
+
+
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
 class MediaResolverTests(unittest.TestCase):
     def test_inline_png_is_realized_from_its_actual_bytes(self) -> None:

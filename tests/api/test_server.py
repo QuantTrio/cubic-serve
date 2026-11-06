@@ -169,6 +169,41 @@ def _sse_json(messages: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 class ServerTests(unittest.TestCase):
+    def test_multimegabyte_inline_image_reaches_common_decoder(self):
+        import base64
+        from io import BytesIO
+        from PIL import Image
+        from cubic_serve.inputs.chat import MediaResolver
+
+        encoded = BytesIO()
+        Image.new("RGB", (1024, 768), "blue").save(encoded, format="PNG", compress_level=0)
+        data = base64.b64encode(encoded.getvalue()).decode()
+
+        class ImageBackend(_Backend):
+            async def start(self, request):
+                self.media = MediaResolver().realize(request)
+                return await super().start(request)
+
+        backend = ImageBackend(lambda request: _text_events(request, "image received"))
+        app = CubicASGIApp(backend, model_id="fixture")
+        payload = dict(_openai_payload(stream=False))
+        payload["messages"] = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + data}}]}]
+        self.assertGreater(len(json.dumps(payload)), 2 << 20)
+        response = asyncio.run(_invoke(app, "/v1/chat/completions", payload))
+        self.assertEqual(response[0]["status"], 200)
+        self.assertEqual(backend.media[0].part.media.mime_type, "image/png")
+        self.assertEqual(tuple(backend.media[0].frames.shape), (1, 768, 1024, 3))
+
+    def test_aggregate_body_limit_rejects_chunked_input_before_backend(self):
+        backend = _Backend(lambda request: _text_events(request, "unused"))
+        app = CubicASGIApp(backend, model_id="fixture")
+        with patch.object(server, "MAX_JSON_BODY_BYTES", 32):
+            response = asyncio.run(_invoke(app, "/v1/chat/completions", {}, raw_body=b"x" * 33))
+        self.assertEqual(response[0]["status"], 413)
+        self.assertEqual(_json_response(response)["error"]["message"], "request body is too large")
+        self.assertEqual(backend.requests, [])
+
     def test_api_key_rejects_invalid_configuration(self) -> None:
         backend = _Backend(lambda request: _text_events(request, "hello"))
         for key in ("", "has space", "newline\n", "\x00", "\x7f", "秘密", 123):

@@ -30,6 +30,7 @@ from cubic_serve.contracts.request import (
     MediaSource,
     MediaSourceKind,
 )
+from cubic_serve.inputs.normalize import MAX_MEDIA_BYTES
 
 ReasoningEffort = Literal["xhigh", "medium", "low"]
 
@@ -60,7 +61,7 @@ class MediaResolver:
         self,
         *,
         allowed_local_media_path: str | Path | None = None,
-        max_bytes: int = 32 << 20,
+        max_bytes: int = MAX_MEDIA_BYTES,
         max_frames: int = 768,
         max_decoded_pixels: int = 64 << 20,
         video_fps: float = 2.0,
@@ -337,11 +338,12 @@ class MediaResolver:
     ) -> DecodedMedia:
         """Decode one bounded image in-process; video alone uses ffmpeg."""
 
+        self._validate_mime("image", mime_type)
         try:
             with Image.open(BytesIO(payload)) as source:
                 detected_mime = Image.MIME.get(source.format or "")
-                if detected_mime is None or detected_mime.lower() != mime_type.lower():
-                    raise ChatProcessorError("image MIME type differs from its encoded payload")
+                if detected_mime is None or not detected_mime.lower().startswith("image/"):
+                    raise ChatProcessorError("encoded payload is not a supported image")
                 width, height = source.size
                 if width <= 0 or height <= 0 or width * height > self._max_decoded_pixels:
                     raise ChatProcessorError("decoded media exceeds the frame or pixel limit")
@@ -353,7 +355,7 @@ class MediaResolver:
             raise ChatProcessorError("media could not be decoded as an image") from error
         height, width = int(frames.shape[1]), int(frames.shape[2])
         digest = f"b2s256:{hashlib.blake2s(payload).hexdigest()}"
-        descriptor = MediaDescriptor(digest, mime_type.lower(), len(payload), width, height)
+        descriptor = MediaDescriptor(digest, detected_mime.lower(), len(payload), width, height)
         return DecodedMedia(
             ContentPart(ordinal, "image", media=descriptor),
             frames,

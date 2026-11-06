@@ -34,7 +34,8 @@ class ChatNormalizationError(ValueError):
     """A public chat payload cannot be represented without changing semantics."""
 
 
-MAX_INLINE_MEDIA_BASE64_CHARS = 32 * 1024 * 1024
+MAX_MEDIA_BYTES = 32 * 1024 * 1024
+MAX_INLINE_MEDIA_BASE64_CHARS = 4 * ((MAX_MEDIA_BYTES + 2) // 3)
 
 
 _OPENAI_TOP_LEVEL_FIELDS = frozenset(
@@ -1285,6 +1286,7 @@ def normalize_anthropic_messages(
 
 
 __all__ = (
+    "MAX_MEDIA_BYTES",
     "MAX_INLINE_MEDIA_BASE64_CHARS",
     "ChatNormalizationError",
     "normalize_anthropic_messages",
